@@ -3,28 +3,30 @@
  * -----------------------------------------------------------
  * - 5V relay module, active-LOW inputs (standard for this class of board —
  *   verify with a meter on IN1 if relays behave inverted; flip RELAY_ACTIVE_LOW).
- * - Pin mapping per your wiring:
- *     IN1 -> GPIO27   IN2 -> GPIO14   IN3 -> GPIO12   IN4 -> GPIO13
- *   WARNING: GPIO12 is a boot strapping pin (MTDI). If your relay board's
- *   opto-isolator input pulls it high during boot, the ESP32 can select the
- *   wrong internal flash voltage and fail to boot (brownout / boot loop).
- *   If you see that, move IN3's wire to a non-strapping pin (e.g. GPIO26)
- *   instead of just re-flashing and hoping.
+ * - Pin mapping per your wiring (no strapping pins used — safe set):
+ *     IN1 -> GPIO27   IN2 -> GPIO26   IN3 -> GPIO14   IN4 -> GPIO25
  * - State persisted in NVS via Preferences, restored on boot with a stagger
  *   delay between relays being switched ON (not simultaneous) to limit
  *   inrush / voltage sag.
  * - Onboard status LED (assumed GPIO2 — verify for your specific board):
  *     solid ON       = WiFi connecting / disconnected
  *     dim short pulse = WiFi connected
- * - Static IP: last octet .250, gateway/subnet below are PLACEHOLDERS —
- *   set them to match your actual router/subnet before flashing.
+ * - IP assignment: connects via DHCP first to learn the network's gateway
+ *   and subnet mask, then reconnects with those same values but forces the
+ *   host address to end in STATIC_HOST_OCTET (.250 by default). This assumes
+ *   a standard /24 (255.255.255.0) subnet — true for nearly all home/office
+ *   routers. If yours uses something else, check the serial log after first
+ *   boot; the derived address will be wrong and you'll need to hardcode it
+ *   instead (see setupWiFi() below).
+ *   CAVEAT: this does not check whether .250 is already taken by another
+ *   device on your network. If you get IP conflicts, pick a different
+ *   STATIC_HOST_OCTET or reserve .250 in your router's DHCP settings.
  * - Dashboard is served from flash (no SPIFFS/LittleFS needed), all control
  *   is fetch()-based, no page reloads.
  * - Relay names are renameable from the dashboard settings panel and persist
  *   in NVS.
  */
 
-#include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
@@ -34,11 +36,10 @@
 const char* WIFI_SSID     = "Zen";
 const char* WIFI_PASSWORD = "genos951";
 
-// Placeholders — MUST match your actual network, not just the last octet.
-IPAddress STATIC_IP (192, 168, 43, 250);
-IPAddress GATEWAY   (192, 168, 43, 1);
-IPAddress SUBNET     (255, 255, 255, 0);
-IPAddress DNS_SERVER (192, 168, 43, 1);
+// Desired last octet of the static IP, e.g. 250 -> x.x.x.250.
+// Gateway/subnet/DNS are auto-detected from DHCP at boot — see setupWiFi().
+const uint8_t STATIC_HOST_OCTET = 250;
+const unsigned long WIFI_CONNECT_TIMEOUT_MS = 20000;
 
 #define RELAY_ACTIVE_LOW true   // standard for 5V opto-isolated relay boards; flip if inverted
 
@@ -121,6 +122,92 @@ void updateStatusLed() {
     // Dim short pulse roughly every 1.6s to indicate "connected, idle"
     unsigned long phase = millis() % 1600;
     ledcWrite(LED_CHANNEL, phase < 150 ? 25 : 0);
+  }
+}
+
+// ---------------- WiFi (auto-detected subnet, forced host octet) ----------------
+
+bool waitForConnection(unsigned long timeoutMs) {
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
+    delay(300);
+    Serial.print(".");
+    updateStatusLed();
+  }
+  Serial.println();
+  return WiFi.status() == WL_CONNECTED;
+}
+
+void setupWiFi() {
+  currentLedState = LED_CONNECTING;
+  WiFi.mode(WIFI_STA);
+
+  // Phase 1: connect via plain DHCP so the router tells us the real
+  // gateway/subnet/DNS for this network. We don't know these in advance.
+  Serial.print("Connecting via DHCP to learn network config");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  if (!waitForConnection(WIFI_CONNECT_TIMEOUT_MS)) {
+    currentLedState = LED_CONNECTING; // stays solid — not connected
+    Serial.println("DHCP connect failed within timeout. Relays still work locally "
+                    "and keep their state; dashboard unreachable until WiFi connects. "
+                    "No retry loop implemented here — add one if this must run "
+                    "unattended on a flaky network.");
+    return;
+  }
+
+  IPAddress dhcpIP  = WiFi.localIP();
+  IPAddress gateway = WiFi.gatewayIP();
+  IPAddress subnet  = WiFi.subnetMask();
+  IPAddress dns     = WiFi.dnsIP();
+
+  Serial.printf("DHCP lease: %s  gateway: %s  subnet: %s\n",
+                dhcpIP.toString().c_str(), gateway.toString().c_str(), subnet.toString().c_str());
+
+  // Only the last octet is forced; the network/gateway/subnet/DNS all come
+  // from what DHCP just told us. This is only correct for a /24 subnet
+  // (255.255.255.0) — check the subnet printed above if you're unsure.
+  if (subnet != IPAddress(255, 255, 255, 0)) {
+    Serial.println("WARNING: subnet mask is not 255.255.255.0 — the auto-derived "
+                    "static IP below is probably wrong for your network. Falling "
+                    "back to the DHCP-assigned address instead.");
+    currentLedState = LED_CONNECTED;
+    return;
+  }
+
+  IPAddress targetIP = dhcpIP;
+  targetIP[3] = STATIC_HOST_OCTET;
+
+  if (targetIP == dhcpIP) {
+    Serial.println("DHCP already assigned the target host octet — keeping current lease.");
+    currentLedState = LED_CONNECTED;
+    return;
+  }
+
+  Serial.printf("Reconnecting with static IP: %s\n", targetIP.toString().c_str());
+
+  // Phase 2: disconnect and reconnect with the derived static config applied.
+  // WiFi.config() only takes effect on the next WiFi.begin(), not retroactively.
+  WiFi.disconnect(true);
+  delay(200);
+
+  if (!WiFi.config(targetIP, gateway, subnet, dns)) {
+    Serial.println("WiFi.config() rejected the derived static IP — reconnecting via DHCP instead.");
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    currentLedState = waitForConnection(WIFI_CONNECT_TIMEOUT_MS) ? LED_CONNECTED : LED_CONNECTING;
+    return;
+  }
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Reconnecting with static IP");
+  if (waitForConnection(WIFI_CONNECT_TIMEOUT_MS)) {
+    currentLedState = LED_CONNECTED;
+    Serial.print("Connected. IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    currentLedState = LED_CONNECTING;
+    Serial.println("Static-IP reconnect failed — possible IP conflict with another "
+                    "device already using this address, or the router rejected it. "
+                    "Dashboard is unreachable until this resolves.");
   }
 }
 
@@ -356,33 +443,8 @@ void setup() {
   // switching / inrush on multiple loads at once.
   restoreRelaysStaggered();
 
-  // WiFi with static IP
-  WiFi.mode(WIFI_STA);
-  if (!WiFi.config(STATIC_IP, GATEWAY, SUBNET, DNS_SERVER)) {
-    Serial.println("WiFi.config() failed — check STATIC_IP/GATEWAY/SUBNET values above.");
-  }
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  Serial.print("Connecting to WiFi");
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
-    delay(300);
-    Serial.print(".");
-    updateStatusLed(); // stays solid while connecting
-  }
-  Serial.println();
-
-  if (WiFi.status() == WL_CONNECTED) {
-    currentLedState = LED_CONNECTED;
-    Serial.print("Connected. IP: ");
-    Serial.println(WiFi.localIP());
-  } else {
-    currentLedState = LED_CONNECTING; // stays solid — signals "not connected"
-    Serial.println("WiFi failed to connect within 20s. Relays still function locally "
-                    "and retain their state; dashboard is unreachable until WiFi connects. "
-                    "No auto-retry loop is implemented — add one if this needs to run "
-                    "unattended on a network that drops out.");
-  }
+  // WiFi: DHCP-discover network config, then pin the host address to .250
+  setupWiFi();
 
   // Routes
   server.on("/", handleRoot);
