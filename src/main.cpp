@@ -32,6 +32,16 @@
  *   WiFi network at least once — it will NOT work while only running in
  *   AP fallback mode with no upstream internet. Timezone defaults to IST
  *   (UTC+5:30) — change GMT_OFFSET_SEC if that's wrong for you.
+ * - Missed-event catch-up (power outage at trigger time): the device stamps
+ *   "last known alive" time into NVS every few minutes and whenever a
+ *   schedule event fires. After the first NTP sync following boot, it finds
+ *   each enabled schedule's most recent event; if that event happened AFTER
+ *   the last alive stamp (i.e. while the device was off), it is applied once.
+ *   LIMITS: (1) it can't run until NTP syncs, so for the first seconds after
+ *   power returns relays sit in their last SAVED state, then flip; with no
+ *   internet it never runs. A battery-backed RTC (e.g. DS3231) is the only
+ *   real fix for that. (2) A relay you manually toggled after boot but before
+ *   time sync is skipped by catch-up (your manual action wins).
  * - Dashboard is served from flash (no SPIFFS/LittleFS needed), all control
  *   is fetch()-based, no page reloads. Settings panel (gear icon) allows
  *   renaming switches and configuring their schedules.
@@ -50,7 +60,7 @@ const char* WIFI_PASSWORD = "genos951";
 // Fallback access point — used only when your real WiFi is unreachable.
 // WPA2 requires 8+ chars for AP_PASSWORD. CHANGE THIS before deploying
 // anywhere not fully trusted; anyone in range can join this AP otherwise.
-const char* AP_SSID     = "RELAY Control 1";
+const char* AP_SSID     = "Relay Control";
 const char* AP_PASSWORD = "relay1234";
 
 // Desired last octet of the static IP, e.g. 250 -> x.x.x.250.
@@ -99,6 +109,12 @@ bool apActive = false;
 unsigned long lastReconnectAttempt = 0;
 bool timeSynced = false;
 int lastScheduleCheckMinute = -1;
+
+// Missed-event catch-up bookkeeping
+const unsigned long ALIVE_STAMP_INTERVAL_MS = 5UL * 60UL * 1000UL; // "last alive" stamp period
+unsigned long lastAliveStampMs = 0;
+bool catchUpDone = false;       // catch-up runs once per boot, on first valid time
+bool manualTouched[4] = {false, false, false, false}; // user changed relay before catch-up ran
 
 // ---------------- Relay control ----------------
 
@@ -194,8 +210,65 @@ void updateStatusLed() {
 // ---------------- NTP / scheduling ----------------
 
 void configureNTP() {
+  // timeSynced is deliberately NOT reset here: configureNTP() runs on every
+  // WiFi reconnect, and the clock stays valid across reconnects.
   configTime(GMT_OFFSET_SEC, DST_OFFSET_SEC, NTP_SERVER_1, NTP_SERVER_2);
-  timeSynced = false; // confirmed true once checkSchedules() sees a plausible timestamp
+}
+
+// Record "the device was alive at this wall-clock time" so that after a power
+// loss we can tell which scheduled events happened while it was off.
+void stampAlive(time_t now) {
+  prefs.putULong("alive", (uint32_t)now);
+}
+
+// Epoch of the most recent occurrence (at or before `now`) of HH:MM local time.
+// Uses a fixed 86400s day: correct because DST_OFFSET_SEC is 0 in this firmware.
+// If you ever enable DST, revisit this.
+time_t lastOccurrence(time_t now, uint8_t hour, uint8_t minute) {
+  struct tm t;
+  localtime_r(&now, &t);
+  t.tm_hour = hour;
+  t.tm_min  = minute;
+  t.tm_sec  = 0;
+  t.tm_isdst = -1;
+  time_t candidate = mktime(&t);
+  if (candidate > now) candidate -= 86400;
+  return candidate;
+}
+
+// Applies, once per boot, the most recent schedule event that occurred while
+// the device had no power. Only the latest missed event per relay matters,
+// because it determines the final state. ON transitions are staggered like
+// the boot restore, to avoid switching several loads simultaneously.
+void catchUpMissedEvents(time_t now) {
+  uint32_t lastAlive = prefs.getULong("alive", 0);
+  if (lastAlive == 0) {
+    Serial.println("Catch-up: no previous uptime record (first boot with this "
+                    "firmware, or never synced) — skipping.");
+    return;
+  }
+
+  bool firstOnApplied = false;
+  for (uint8_t i = 0; i < 4; i++) {
+    if (!schedules[i].enabled) continue;
+    if (manualTouched[i]) continue; // user already made a manual choice this boot
+
+    time_t lastOn  = lastOccurrence(now, schedules[i].onHour,  schedules[i].onMinute);
+    time_t lastOff = lastOccurrence(now, schedules[i].offHour, schedules[i].offMinute);
+    bool latestIsOn = (lastOn >= lastOff); // tie -> ON, same precedence as live triggering
+    time_t latest = latestIsOn ? lastOn : lastOff;
+
+    if (latest <= (time_t)lastAlive) continue;      // that event happened while we were running
+    if (relayState[i] == latestIsOn) continue;      // already in the right state
+
+    if (latestIsOn) {
+      if (firstOnApplied) delay(STARTUP_STAGGER_MS);
+      firstOnApplied = true;
+    }
+    setRelay(i, latestIsOn);
+    Serial.printf("Catch-up: relay %d -> %s (missed scheduled event while powered off)\n",
+                  i, latestIsOn ? "ON" : "OFF");
+  }
 }
 
 // Fires at most once per calendar minute, only once NTP has produced a
@@ -213,21 +286,44 @@ void checkSchedules() {
   struct tm timeinfo;
   localtime_r(&now, &timeinfo);
   int minuteOfDay = timeinfo.tm_hour * 60 + timeinfo.tm_min;
+
+  // First valid time after boot: apply any event missed during downtime.
+  if (!catchUpDone) {
+    catchUpDone = true;
+    catchUpMissedEvents(now);
+    stampAlive(now);
+    lastAliveStampMs = millis();
+    lastScheduleCheckMinute = minuteOfDay; // this minute's event (if any) is already covered above
+    return;
+  }
+
+  // Periodic "still alive" stamp (cheap: NVS skips unchanged values and
+  // wear-levels; one write per 5 min is negligible wear by my estimate).
+  if (millis() - lastAliveStampMs >= ALIVE_STAMP_INTERVAL_MS) {
+    lastAliveStampMs = millis();
+    stampAlive(now);
+  }
+
   if (minuteOfDay == lastScheduleCheckMinute) return; // already handled this minute
   lastScheduleCheckMinute = minuteOfDay;
 
+  bool fired = false;
   for (uint8_t i = 0; i < 4; i++) {
     if (!schedules[i].enabled) continue;
     int onM  = schedules[i].onHour * 60 + schedules[i].onMinute;
     int offM = schedules[i].offHour * 60 + schedules[i].offMinute;
     if (minuteOfDay == onM) {
       setRelay(i, true);
+      fired = true;
       Serial.printf("Schedule: relay %d ON (%02d:%02d)\n", i, schedules[i].onHour, schedules[i].onMinute);
     } else if (minuteOfDay == offM) {
       setRelay(i, false);
+      fired = true;
       Serial.printf("Schedule: relay %d OFF (%02d:%02d)\n", i, schedules[i].offHour, schedules[i].offMinute);
     }
   }
+  // Stamp right after a fired event so a reboot doesn't treat it as "missed".
+  if (fired) stampAlive(now);
 }
 
 // ---------------- WiFi: initial connect (auto-detected subnet, forced host octet) ----------------
@@ -574,6 +670,7 @@ void handleSet() {
     server.send(400, "text/plain", "relay index out of range");
     return;
   }
+  manualTouched[idx] = true;
   setRelay(idx, state);
   server.send(200, "text/plain", "ok");
 }
@@ -584,7 +681,10 @@ void handleAll() {
     return;
   }
   bool state = server.arg("state").toInt() == 1;
-  for (uint8_t i = 0; i < 4; i++) setRelay(i, state);
+  for (uint8_t i = 0; i < 4; i++) {
+    manualTouched[i] = true;
+    setRelay(i, state);
+  }
   server.send(200, "text/plain", "ok");
 }
 
@@ -641,6 +741,11 @@ void handleSchedule() {
   schedules[idx].offHour   = offH;
   schedules[idx].offMinute = offM;
   saveSchedule(idx);
+  if (timeSynced) { // an edit must not create retroactive "missed" events
+    time_t n;
+    time(&n);
+    stampAlive(n);
+  }
   server.send(200, "text/plain", "ok");
 }
 
