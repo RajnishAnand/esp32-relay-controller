@@ -42,6 +42,21 @@
  *   internet it never runs. A battery-backed RTC (e.g. DS3231) is the only
  *   real fix for that. (2) A relay you manually toggled after boot but before
  *   time sync is skipped by catch-up (your manual action wins).
+ * - OTA updates from GitHub releases, approved from the dashboard (see OTA.md):
+ *     - Checks <repo>/releases/latest/download/manifest.txt every few hours
+ *       (and on demand). Shows "update available"; NOTHING installs until
+ *       you tap Install.
+ *     - The manifest (version, size, sha256) is ECDSA-signed with a private
+ *       key that stays on your computer; the device verifies it against
+ *       OTA_PUBLIC_KEY_PEM, then checks the downloaded firmware's SHA-256
+ *       against the signed manifest BEFORE activating it. TLS certificates
+ *       are not validated by default (OTA_ROOT_CA_PEM = nullptr) because
+ *       authenticity comes from the signature, not the transport.
+ *     - Software rollback: a freshly installed firmware must stay up for
+ *       OTA_CONFIRM_AFTER_MS to confirm itself. If it reboots more than
+ *       OTA_MAX_UNCONFIRMED_BOOTS times before that, the previous slot is
+ *       re-activated. It cannot catch a crash before setup() runs, or a
+ *       firmware that runs but misbehaves.
  * - Dashboard is served from flash (no SPIFFS/LittleFS needed), all control
  *   is fetch()-based, no page reloads. Settings panel (gear icon) allows
  *   renaming switches and configuring their schedules.
@@ -51,16 +66,23 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include "time.h"
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <Update.h>
+#include "esp_ota_ops.h"
+#include "mbedtls/pk.h"
+#include "mbedtls/sha256.h"
+#include "version.h"
 
 // ---------------- USER CONFIG ----------------
 
-const char* WIFI_SSID     = "Zen";
-const char* WIFI_PASSWORD = "genos951";
+const char* WIFI_SSID     = "YOUR_WIFI_SSID";
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
 
 // Fallback access point — used only when your real WiFi is unreachable.
 // WPA2 requires 8+ chars for AP_PASSWORD. CHANGE THIS before deploying
 // anywhere not fully trusted; anyone in range can join this AP otherwise.
-const char* AP_SSID     = "Relay Control";
+const char* AP_SSID     = "ESP32-Relay-Setup";
 const char* AP_PASSWORD = "relay1234";
 
 // Desired last octet of the static IP, e.g. 250 -> x.x.x.250.
@@ -89,6 +111,30 @@ const int  DST_OFFSET_SEC = 0;
 const char* NTP_SERVER_1 = "pool.ntp.org";
 const char* NTP_SERVER_2 = "time.google.com";
 const time_t MIN_VALID_EPOCH = 1700000000; // ~Nov 2023 — below this, NTP hasn't synced yet
+
+// ---- OTA updates (see OTA.md) ----
+// Repo must be PUBLIC. Release tags must be "v" + version (e.g. v1.0.1), and each
+// release must carry the assets firmware.bin, manifest.txt and manifest.sig
+// (tools/release.sh creates all three).
+const char* OTA_GITHUB_OWNER = "YOUR_GITHUB_USER";
+const char* OTA_GITHUB_REPO  = "YOUR_REPO";
+
+// ECDSA P-256 PUBLIC key (PEM) matching the private key tools/release.sh signs with.
+const char* OTA_PUBLIC_KEY_PEM =
+"-----BEGIN PUBLIC KEY-----\n"
+"REPLACE_ME\n"
+"-----END PUBLIC KEY-----\n";
+
+// Optional PEM root CA to validate GitHub's TLS certificate. nullptr = TLS is not
+// validated (safe here ONLY because everything is verified by signature; see OTA.md).
+// If you set one, it must cover BOTH github.com and the asset host it redirects to.
+const char* OTA_ROOT_CA_PEM = nullptr;
+
+const unsigned long OTA_AUTO_CHECK_INTERVAL_MS = 6UL * 3600UL * 1000UL; // background check period
+const unsigned long OTA_FIRST_CHECK_DELAY_MS   = 120UL * 1000UL;        // first check after boot
+const unsigned long OTA_CONFIRM_AFTER_MS       = 90UL * 1000UL;         // uptime that confirms a new image
+const uint8_t       OTA_MAX_UNCONFIRMED_BOOTS  = 3;                     // then roll back
+const size_t        OTA_MAX_MANIFEST_BYTES     = 512;
 
 // ------------------------------------------------
 
@@ -451,6 +497,382 @@ void handleWifiMonitor() {
   }
 }
 
+// ---------------- OTA update: GitHub release, signed manifest, approval-gated ----------------
+//
+// Flow: a check downloads manifest.txt + manifest.sig, verifies the signature, and compares
+// versions. If newer, state becomes AVAILABLE and the dashboard offers Install. Install
+// downloads firmware.bin, streams it into the inactive OTA slot while hashing it, compares the
+// hash to the signed manifest, and only then activates the slot and reboots.
+// Nothing here installs without an explicit POST /api/update/apply.
+
+enum OtaState {
+  OTA_IDLE, OTA_CHECKING, OTA_UP_TO_DATE, OTA_AVAILABLE,
+  OTA_DOWNLOADING, OTA_VERIFYING, OTA_REBOOTING, OTA_ERROR
+};
+
+OtaState otaState = OTA_IDLE;
+String otaLatestVersion = "";
+String otaMessage = "";            // fixed strings + validated versions only (safe to embed in JSON)
+uint8_t otaProgress = 0;           // 0-100 while downloading
+bool otaCheckRequested = false;
+bool otaApplyRequested = false;
+bool otaEverChecked = false;
+unsigned long otaLastCheckMs = 0;
+unsigned long otaNextAutoCheckMs = 0;
+bool otaPendingConfirm = false;    // running a freshly installed image that has not confirmed yet
+unsigned long otaConfirmAtMs = 0;
+size_t otaPendingSize = 0;         // from the signed manifest of the AVAILABLE update
+uint8_t otaPendingSha[32];
+
+static inline bool deadlineReached(unsigned long deadline) {
+  return (long)(millis() - deadline) >= 0; // wrap-safe
+}
+
+bool otaConfigured() {
+  return strstr(OTA_GITHUB_OWNER, "YOUR_") == nullptr &&
+         strstr(OTA_GITHUB_REPO, "YOUR_") == nullptr &&
+         strstr(OTA_PUBLIC_KEY_PEM, "REPLACE_ME") == nullptr;
+}
+
+// Strict MAJOR.MINOR.PATCH only (no "v" prefix, no suffixes).
+bool parseSemver(const String& s, int& major, int& minor, int& patch) {
+  int consumed = 0;
+  if (sscanf(s.c_str(), "%d.%d.%d%n", &major, &minor, &patch, &consumed) != 3) return false;
+  if (consumed != (int)s.length()) return false;
+  return major >= 0 && minor >= 0 && patch >= 0;
+}
+
+bool isNewerVersion(const String& remote, const String& local) {
+  int r1, r2, r3, l1, l2, l3;
+  if (!parseSemver(remote, r1, r2, r3) || !parseSemver(local, l1, l2, l3)) return false;
+  if (r1 != l1) return r1 > l1;
+  if (r2 != l2) return r2 > l2;
+  return r3 > l3;
+}
+
+int hexVal(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
+bool hexToBytes(const String& hex, uint8_t* out, size_t outLen) {
+  if (hex.length() != outLen * 2) return false;
+  for (size_t i = 0; i < outLen; i++) {
+    int hi = hexVal(hex[i * 2]);
+    int lo = hexVal(hex[i * 2 + 1]);
+    if (hi < 0 || lo < 0) return false;
+    out[i] = (uint8_t)((hi << 4) | lo);
+  }
+  return true;
+}
+
+String manifestValue(const String& manifest, const char* key) {
+  String needle = String(key) + "=";
+  int pos = 0;
+  while (pos < (int)manifest.length()) {
+    int end = manifest.indexOf('\n', pos);
+    if (end < 0) end = manifest.length();
+    String line = manifest.substring(pos, end);
+    line.trim();
+    if (line.startsWith(needle)) return line.substring(needle.length());
+    pos = end + 1;
+  }
+  return "";
+}
+
+void otaConfigureTls(WiFiClientSecure& client) {
+  if (OTA_ROOT_CA_PEM != nullptr) client.setCACert(OTA_ROOT_CA_PEM);
+  else client.setInsecure();
+}
+
+// ECDSA (DER) signature over SHA-256(data), checked against OTA_PUBLIC_KEY_PEM.
+bool otaVerifySignature(const uint8_t* data, size_t len, const uint8_t* sig, size_t sigLen) {
+  mbedtls_pk_context pk;
+  mbedtls_pk_init(&pk);
+  int rc = mbedtls_pk_parse_public_key(&pk, (const unsigned char*)OTA_PUBLIC_KEY_PEM,
+                                       strlen(OTA_PUBLIC_KEY_PEM) + 1);
+  if (rc != 0) {
+    Serial.printf("OTA: public key parse failed (%d)\n", rc);
+    mbedtls_pk_free(&pk);
+    return false;
+  }
+  uint8_t hash[32];
+  rc = mbedtls_sha256_ret(data, len, hash, 0);
+  if (rc == 0) rc = mbedtls_pk_verify(&pk, MBEDTLS_MD_SHA256, hash, sizeof(hash), sig, sigLen);
+  mbedtls_pk_free(&pk);
+  return rc == 0;
+}
+
+// Pumped during long operations so the dashboard, LED and schedules keep working.
+void otaPump() {
+  server.handleClient();
+  updateStatusLed();
+  checkSchedules();
+}
+
+// Downloads a small file (<= maxBytes, length must be advertised) into buf. Returns length or -1.
+int otaFetchSmall(const String& url, uint8_t* buf, size_t maxBytes) {
+  WiFiClientSecure client;
+  otaConfigureTls(client);
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS); // GitHub assets redirect to another host
+  http.setTimeout(10000);
+  if (!http.begin(client, url)) return -1;
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    Serial.printf("OTA: GET failed, HTTP %d\n", code);
+    http.end();
+    return -1;
+  }
+  int len = http.getSize();
+  if (len <= 0 || (size_t)len > maxBytes) {
+    http.end();
+    return -1;
+  }
+  WiFiClient* stream = http.getStreamPtr();
+  int got = 0;
+  unsigned long start = millis();
+  while (got < len && millis() - start < 10000) {
+    int avail = stream->available();
+    if (avail > 0) {
+      size_t want = (size_t)(avail < (len - got) ? avail : (len - got));
+      size_t n = stream->readBytes(buf + got, want);
+      if (n == 0) break;
+      got += (int)n;
+    } else if (!http.connected()) {
+      break;
+    } else {
+      delay(5);
+    }
+  }
+  http.end();
+  return got == len ? got : -1;
+}
+
+// Returns nullptr on a clean check (state set to UP_TO_DATE or AVAILABLE), else an error text.
+const char* otaCheckInner() {
+  String base = String("https://github.com/") + OTA_GITHUB_OWNER + "/" + OTA_GITHUB_REPO +
+                "/releases/latest/download/";
+
+  static uint8_t manifestBuf[OTA_MAX_MANIFEST_BYTES + 1];
+  static uint8_t sigBuf[80];
+  int mlen = otaFetchSmall(base + "manifest.txt", manifestBuf, OTA_MAX_MANIFEST_BYTES);
+  if (mlen < 0) return "Could not download manifest (no release yet, or network error)";
+  int slen = otaFetchSmall(base + "manifest.sig", sigBuf, sizeof(sigBuf));
+  if (slen < 0) return "Could not download manifest signature";
+  if (!otaVerifySignature(manifestBuf, (size_t)mlen, sigBuf, (size_t)slen))
+    return "Manifest signature INVALID - refusing update";
+
+  manifestBuf[mlen] = 0;
+  String manifest = String((const char*)manifestBuf);
+  String version = manifestValue(manifest, "version");
+  long size = manifestValue(manifest, "size").toInt();
+  uint8_t sha[32];
+  int a, b, c;
+  if (!parseSemver(version, a, b, c)) return "Manifest has an invalid version";
+  if (size < 100000 || size > 4L * 1024 * 1024) return "Manifest has an invalid size";
+  if (!hexToBytes(manifestValue(manifest, "sha256"), sha, sizeof(sha))) return "Manifest has an invalid sha256";
+
+  otaLatestVersion = version;
+  otaMessage = "";
+  if (!isNewerVersion(version, FIRMWARE_VERSION)) {
+    otaState = OTA_UP_TO_DATE;
+    return nullptr;
+  }
+  if (prefs.getString("ota_bad", "") == version) {
+    otaState = OTA_UP_TO_DATE;
+    otaMessage = String("v") + version + " failed on this device and was rolled back; waiting for a newer release";
+    return nullptr;
+  }
+  otaPendingSize = (size_t)size;
+  memcpy(otaPendingSha, sha, sizeof(sha));
+  otaState = OTA_AVAILABLE;
+  return nullptr;
+}
+
+// Manual checks surface errors on the dashboard; background checks fail silently
+// and leave the previous state untouched.
+bool otaRunCheck(bool userInitiated) {
+  if (!otaConfigured()) {
+    if (userInitiated) { otaState = OTA_ERROR; otaMessage = "Updates are not configured in the firmware (see OTA.md)"; }
+    return false;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    if (userInitiated) { otaState = OTA_ERROR; otaMessage = "Not connected to WiFi"; }
+    return false;
+  }
+  OtaState prevState = otaState;
+  String prevMessage = otaMessage;
+  otaState = OTA_CHECKING;
+  const char* err = otaCheckInner();
+  if (err != nullptr) {
+    Serial.printf("OTA check failed: %s\n", err);
+    if (userInitiated) { otaState = OTA_ERROR; otaMessage = err; }
+    else { otaState = prevState; otaMessage = prevMessage; }
+    return false;
+  }
+  otaEverChecked = true;
+  otaLastCheckMs = millis();
+  Serial.printf("OTA check ok: latest v%s, running v%s\n", otaLatestVersion.c_str(), FIRMWARE_VERSION);
+  return true;
+}
+
+void otaFail(const char* msg) {
+  Serial.printf("OTA install failed: %s\n", msg);
+  otaState = OTA_ERROR;
+  otaMessage = msg;
+}
+
+// Runs only after the user's explicit apply request. Blocks (while pumping the web server).
+void otaRunInstall() {
+  if (otaPendingSize == 0 || otaLatestVersion.length() == 0) { otaFail("No update is staged"); return; }
+  if (otaPendingConfirm) { otaFail("The previous update has not confirmed yet - wait a minute and retry"); return; }
+  if (WiFi.status() != WL_CONNECTED) { otaFail("Not connected to WiFi"); return; }
+
+  otaState = OTA_DOWNLOADING;
+  otaProgress = 0;
+  otaMessage = "";
+
+  String url = String("https://github.com/") + OTA_GITHUB_OWNER + "/" + OTA_GITHUB_REPO +
+               "/releases/download/v" + otaLatestVersion + "/firmware.bin";
+
+  WiFiClientSecure client;
+  otaConfigureTls(client);
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  http.setTimeout(10000);
+  if (!http.begin(client, url)) { otaFail("Could not start the download"); return; }
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) { http.end(); otaFail("Firmware download failed (HTTP error)"); return; }
+  int len = http.getSize();
+  if (len <= 0 || (size_t)len != otaPendingSize) {
+    http.end();
+    otaFail("Firmware size does not match the signed manifest");
+    return;
+  }
+  if (!Update.begin(otaPendingSize)) {
+    http.end();
+    otaFail("Firmware does not fit in the update slot");
+    return;
+  }
+
+  mbedtls_sha256_context sha;
+  mbedtls_sha256_init(&sha);
+  mbedtls_sha256_starts_ret(&sha, 0);
+
+  static uint8_t buf[1024];
+  WiFiClient* stream = http.getStreamPtr();
+  size_t written = 0;
+  unsigned long lastData = millis();
+  const char* err = nullptr;
+
+  while (written < otaPendingSize) {
+    otaPump();
+    int avail = stream->available();
+    if (avail > 0) {
+      size_t remaining = otaPendingSize - written;
+      size_t want = (size_t)avail;
+      if (want > sizeof(buf)) want = sizeof(buf);
+      if (want > remaining) want = remaining;
+      size_t n = stream->readBytes(buf, want);
+      if (n == 0) { err = "Download read error"; break; }
+      mbedtls_sha256_update_ret(&sha, buf, n);
+      if (Update.write(buf, n) != n) { err = "Flash write failed"; break; }
+      written += n;
+      lastData = millis();
+      otaProgress = (uint8_t)((written * 100UL) / otaPendingSize);
+    } else {
+      if (!http.connected()) { err = "Connection closed before the download finished"; break; }
+      if (millis() - lastData > 20000) { err = "Download stalled"; break; }
+      delay(2);
+    }
+  }
+  http.end();
+
+  uint8_t digest[32];
+  mbedtls_sha256_finish_ret(&sha, digest);
+  mbedtls_sha256_free(&sha);
+
+  if (err != nullptr) { Update.abort(); otaFail(err); return; }
+
+  otaState = OTA_VERIFYING;
+  if (memcmp(digest, otaPendingSha, sizeof(digest)) != 0) {
+    Update.abort();
+    otaFail("Firmware hash does not match the signed manifest - discarded");
+    return;
+  }
+
+  // Arm the first-boot trial BEFORE activating the new image, so even a crash
+  // on its very first boot is counted.
+  prefs.putBool("ota_pend", true);
+  prefs.putUChar("ota_boots", 0);
+  if (!Update.end()) {
+    prefs.putBool("ota_pend", false);
+    otaFail("Finalizing the update failed");
+    return;
+  }
+
+  otaState = OTA_REBOOTING;
+  Serial.println("OTA: image verified and activated, rebooting...");
+  unsigned long t = millis();
+  while (millis() - t < 1500) otaPump(); // let the dashboard see "rebooting"
+  ESP.restart();
+}
+
+// Call early in setup(), right after prefs.begin(). Counts boots of an unconfirmed
+// image and re-activates the previous slot if it keeps failing.
+void otaBootCheck() {
+  otaPendingConfirm = prefs.getBool("ota_pend", false);
+  if (!otaPendingConfirm) return;
+
+  uint8_t boots = (uint8_t)(prefs.getUChar("ota_boots", 0) + 1);
+  prefs.putUChar("ota_boots", boots);
+  Serial.printf("OTA: trial boot %d of %d for v%s\n", boots, OTA_MAX_UNCONFIRMED_BOOTS, FIRMWARE_VERSION);
+
+  if (boots > OTA_MAX_UNCONFIRMED_BOOTS) {
+    prefs.putString("ota_bad", FIRMWARE_VERSION);
+    prefs.putBool("ota_pend", false);
+    prefs.putUChar("ota_boots", 0);
+    otaPendingConfirm = false;
+    const esp_partition_t* previous = esp_ota_get_next_update_partition(NULL);
+    if (previous != NULL && esp_ota_set_boot_partition(previous) == ESP_OK) {
+      Serial.println("OTA: new firmware never confirmed - rolling back to the previous slot");
+      delay(100);
+      ESP.restart();
+    }
+    Serial.println("OTA: rollback target unavailable - staying on this firmware");
+    return;
+  }
+  otaConfirmAtMs = millis() + OTA_CONFIRM_AFTER_MS;
+}
+
+// Call every loop().
+void otaLoop() {
+  if (otaPendingConfirm && deadlineReached(otaConfirmAtMs)) {
+    prefs.putBool("ota_pend", false);
+    prefs.putUChar("ota_boots", 0);
+    otaPendingConfirm = false;
+    Serial.println("OTA: new firmware confirmed healthy.");
+  }
+
+  if (otaApplyRequested) {
+    otaApplyRequested = false;
+    otaRunInstall();
+    return;
+  }
+  if (otaCheckRequested) {
+    otaCheckRequested = false;
+    otaRunCheck(true);
+    return;
+  }
+  if (staConnected && otaConfigured() && !otaPendingConfirm && deadlineReached(otaNextAutoCheckMs)) {
+    otaNextAutoCheckMs = millis() + OTA_AUTO_CHECK_INTERVAL_MS;
+    otaRunCheck(false);
+  }
+}
+
 // ---------------- Dashboard HTML ----------------
 
 const char INDEX_HTML[] PROGMEM = R"HTML(
@@ -498,6 +920,16 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   .schedRow input[type=time] { flex:1; padding:6px; border-radius:6px; border:1px solid #444;
                                 background:#111; color:#eee; font-size:0.9rem; }
   .panel .rowbtns { display:flex; gap:10px; margin-top:18px; }
+  .banner { display:none; background:#1c2b22; border:1px solid #2e8b57; border-radius:10px;
+            padding:12px 16px; margin-bottom:16px; font-size:0.9rem; }
+  .banner.show { display:block; }
+  .banner.error { background:#2b1c1c; border-color:#8b2e2e; }
+  .banner button { margin-top:10px; width:100%; }
+  .bar { height:6px; background:#333; border-radius:3px; margin-top:8px; overflow:hidden; }
+  .bar > div { height:100%; background:#2e8b57; width:0%; transition:width 0.3s; }
+  .fw { margin-top:16px; border-top:1px solid #333; padding-top:12px; font-size:0.85rem; }
+  .fw button { width:100%; margin-top:8px; }
+  #fwStatus { opacity:0.6; margin-top:4px; }
 </style>
 </head>
 <body>
@@ -506,6 +938,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   <button class="gear" onclick="openSettings()" title="Configure">&#9881;</button>
 </div>
 
+<div id="updateBanner" class="banner"></div>
 <div id="relays"></div>
 <div class="allrow">
   <button class="action" onclick="setAll(true)">All ON</button>
@@ -517,6 +950,11 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   <div class="panel">
     <h2>Configure Switches</h2>
     <div id="configFields"></div>
+    <div class="fw">
+      <div id="fwInfo">Firmware</div>
+      <div id="fwStatus"></div>
+      <button class="action" onclick="checkUpdate()">Check for updates</button>
+    </div>
     <div class="rowbtns">
       <button class="action" onclick="saveSettings()">Save</button>
       <button class="action" onclick="closeSettings()">Cancel</button>
@@ -547,7 +985,7 @@ function render(data) {
     card.className = 'card';
     const schedText = r.schedEnabled ? `Schedule: ${r.onTime} – ${r.offTime}` : '';
     card.innerHTML = `
-      <span class="name">${r.name}<span class="status">${r.state ? 'ON' : 'OFF'}</span>
+      <span class="name">${esc(r.name)}<span class="status">${r.state ? 'ON' : 'OFF'}</span>
         ${schedText ? `<span class="sched">${schedText}</span>` : ''}
       </span>
       <label class="switch">
@@ -631,8 +1069,81 @@ async function saveSettings() {
   fetchStatus();
 }
 
+function esc(t) {
+  return String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// ---- firmware update UI ----
+const BUSY = ['checking', 'downloading', 'verifying', 'rebooting'];
+let lastVer = null;
+let updState = null;
+let updFastTimer = null;
+
+function scheduleFast() {
+  if (!updFastTimer) updFastTimer = setTimeout(() => { updFastTimer = null; fetchUpdate(); }, 1000);
+}
+
+async function fetchUpdate() {
+  try {
+    const res = await fetch('/api/update/status');
+    const u = await res.json();
+    if (lastVer && u.current !== lastVer) { location.reload(); return; } // new firmware = new dashboard
+    lastVer = u.current;
+    updState = u.state;
+    renderUpdate(u);
+  } catch (e) { /* device busy or rebooting: keep last state, retry below if it was busy */ }
+  if (BUSY.includes(updState)) scheduleFast();
+}
+
+function renderUpdate(u) {
+  const banner = document.getElementById('updateBanner');
+  let html = '', cls = 'banner';
+  if (u.state === 'available') {
+    html = `Update available: v${esc(u.latest)}<button class="action" onclick="installUpdate('${esc(u.latest)}')">Install v${esc(u.latest)}</button>`;
+  } else if (u.state === 'downloading') {
+    html = `Downloading v${esc(u.latest)}... ${u.progress}%<div class="bar"><div style="width:${u.progress}%"></div></div>`;
+  } else if (u.state === 'verifying') {
+    html = 'Verifying firmware...';
+  } else if (u.state === 'rebooting') {
+    html = 'Installed. Rebooting - relays will restore their saved state.';
+  } else if (u.state === 'checking') {
+    html = 'Checking for updates...';
+  } else if (u.state === 'error') {
+    html = 'Update problem: ' + esc(u.message);
+    cls += ' error';
+  }
+  banner.className = html ? cls + ' show' : cls;
+  banner.innerHTML = html;
+
+  document.getElementById('fwInfo').textContent =
+    'Firmware v' + u.current + (u.pendingConfirm ? ' (new firmware verifying itself...)' : '');
+  let status = '';
+  if (!u.configured) status = 'Updates are not configured in the firmware.';
+  else if (u.state === 'up_to_date') status = u.message ? u.message : 'Up to date.';
+  else if (u.state === 'available') status = 'v' + u.latest + ' is available.';
+  else if (u.state === 'error') status = u.message;
+  if (u.lastCheckSecondsAgo >= 0) status += (status ? ' ' : '') + 'Last checked ' + Math.round(u.lastCheckSecondsAgo / 60) + ' min ago.';
+  document.getElementById('fwStatus').textContent = status;
+}
+
+async function checkUpdate() {
+  document.getElementById('fwStatus').textContent = 'Checking...';
+  try { await fetch('/api/update/check', { method: 'POST' }); } catch (e) {}
+  updState = 'checking';
+  fetchUpdate();
+}
+
+async function installUpdate(v) {
+  if (!confirm('Install v' + v + '?\n\nThe device will reboot. Relays will drop briefly, then restore their saved state. Do not cut power during the update.')) return;
+  try { await fetch('/api/update/apply', { method: 'POST' }); } catch (e) {}
+  updState = 'downloading';
+  fetchUpdate();
+}
+
 fetchStatus();
 setInterval(fetchStatus, 4000); // periodic resync in case another client changes state
+fetchUpdate();
+setInterval(fetchUpdate, 4000);
 </script>
 </body>
 </html>
@@ -647,7 +1158,7 @@ void handleRoot() {
 void handleStatus() {
   String json = "{\"relays\":[";
   for (uint8_t i = 0; i < 4; i++) {
-    char onBuf[6], offBuf[6];
+    char onBuf[8], offBuf[8]; // sized for any uint8_t pair; valid values are always 5 chars
     snprintf(onBuf, sizeof(onBuf), "%02d:%02d", schedules[i].onHour, schedules[i].onMinute);
     snprintf(offBuf, sizeof(offBuf), "%02d:%02d", schedules[i].offHour, schedules[i].offMinute);
     json += "{\"name\":\"" + relayNames[i] + "\",\"state\":" + (relayState[i] ? "true" : "false");
@@ -749,6 +1260,54 @@ void handleSchedule() {
   server.send(200, "text/plain", "ok");
 }
 
+const char* otaStateName() {
+  switch (otaState) {
+    case OTA_CHECKING:    return "checking";
+    case OTA_UP_TO_DATE:  return "up_to_date";
+    case OTA_AVAILABLE:   return "available";
+    case OTA_DOWNLOADING: return "downloading";
+    case OTA_VERIFYING:   return "verifying";
+    case OTA_REBOOTING:   return "rebooting";
+    case OTA_ERROR:       return "error";
+    default:              return "idle";
+  }
+}
+
+bool otaBusy() {
+  return otaState == OTA_CHECKING || otaState == OTA_DOWNLOADING ||
+         otaState == OTA_VERIFYING || otaState == OTA_REBOOTING;
+}
+
+void handleUpdateStatus() {
+  String json = "{\"current\":\"" + String(FIRMWARE_VERSION) + "\"";
+  json += ",\"configured\":" + String(otaConfigured() ? "true" : "false");
+  json += ",\"state\":\"" + String(otaStateName()) + "\"";
+  json += ",\"latest\":\"" + otaLatestVersion + "\"";
+  json += ",\"progress\":" + String((int)otaProgress);
+  json += ",\"message\":\"" + otaMessage + "\"";
+  json += ",\"pendingConfirm\":" + String(otaPendingConfirm ? "true" : "false");
+  json += ",\"lastCheckSecondsAgo\":" +
+          (otaEverChecked ? String((long)((millis() - otaLastCheckMs) / 1000UL)) : String("-1"));
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleUpdateCheck() {
+  if (otaBusy()) { server.send(409, "text/plain", "busy"); return; }
+  otaCheckRequested = true;
+  otaState = OTA_CHECKING; // reflect immediately; the check runs on the next loop()
+  server.send(200, "text/plain", "ok");
+}
+
+void handleUpdateApply() {
+  if (otaState != OTA_AVAILABLE) { server.send(409, "text/plain", "no update available"); return; }
+  otaApplyRequested = true;
+  otaState = OTA_DOWNLOADING; // reflect immediately; the install runs on the next loop()
+  otaProgress = 0;
+  otaMessage = "";
+  server.send(200, "text/plain", "ok");
+}
+
 void handleNotFound() {
   server.send(404, "text/plain", "not found");
 }
@@ -757,6 +1316,8 @@ void handleNotFound() {
 
 void setup() {
   Serial.begin(115200);
+  prefs.begin("relay", false); // namespace "relay", read-write
+  otaBootCheck();               // may roll back to the previous firmware and reboot
   delay(INITIAL_BOOT_DELAY_MS); // let power rails / relay board settle before driving any pins
 
   // Status LED
@@ -766,7 +1327,6 @@ void setup() {
   updateStatusLed();
 
   // Load persisted state BEFORE configuring pins, so we know what to drive them to.
-  prefs.begin("relay", false); // namespace "relay", read-write
   loadStateFromFlash();
 
   // Configure pins and restore state with stagger to avoid simultaneous
@@ -791,7 +1351,11 @@ void setup() {
   server.on("/api/all", handleAll);
   server.on("/api/rename", handleRename);
   server.on("/api/schedule", handleSchedule);
+  server.on("/api/update/status", HTTP_GET, handleUpdateStatus);
+  server.on("/api/update/check", HTTP_POST, handleUpdateCheck);
+  server.on("/api/update/apply", HTTP_POST, handleUpdateApply);
   server.onNotFound(handleNotFound);
+  otaNextAutoCheckMs = millis() + OTA_FIRST_CHECK_DELAY_MS;
   server.begin();
 }
 
@@ -800,4 +1364,5 @@ void loop() {
   updateStatusLed();
   handleWifiMonitor();
   checkSchedules();
+  otaLoop();
 }
