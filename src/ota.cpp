@@ -65,7 +65,7 @@ bool verifySignature(const uint8_t* data, size_t len, const uint8_t* sig, size_t
   }
   uint8_t hash[32];
   mbedtls_sha256(data, len, hash, 0);
-  rc = 0
+  rc = 0;
   if (rc == 0) rc = mbedtls_pk_verify(&pk, MBEDTLS_MD_SHA256, hash, sizeof(hash), sig, sigLen);
   mbedtls_pk_free(&pk);
   return rc == 0;
