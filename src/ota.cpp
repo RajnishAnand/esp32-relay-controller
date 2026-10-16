@@ -64,7 +64,8 @@ bool verifySignature(const uint8_t* data, size_t len, const uint8_t* sig, size_t
     return false;
   }
   uint8_t hash[32];
-  rc = mbedtls_sha256_ret(data, len, hash, 0);
+  mbedtls_sha256(data, len, hash, 0);
+  rc = 0
   if (rc == 0) rc = mbedtls_pk_verify(&pk, MBEDTLS_MD_SHA256, hash, sizeof(hash), sig, sigLen);
   mbedtls_pk_free(&pk);
   return rc == 0;
@@ -224,7 +225,7 @@ void runInstall() {
 
   mbedtls_sha256_context sha;
   mbedtls_sha256_init(&sha);
-  mbedtls_sha256_starts_ret(&sha, 0);
+  mbedtls_sha256_starts(&sha, 0);
 
   static uint8_t buf[1024];
   WiFiClient* stream = http.getStreamPtr();
@@ -244,7 +245,7 @@ void runInstall() {
         error = "Download read error";
         break;
       }
-      mbedtls_sha256_update_ret(&sha, buf, n);
+      mbedtls_sha256_update(&sha, buf, n);
       if (Update.write(buf, n) != n) {
         error = "Flash write failed";
         break;
@@ -267,7 +268,7 @@ void runInstall() {
   http.end();
 
   uint8_t digest[32];
-  mbedtls_sha256_finish_ret(&sha, digest);
+  mbedtls_sha256_finish(&sha, digest);
   mbedtls_sha256_free(&sha);
 
   if (error != nullptr) {
