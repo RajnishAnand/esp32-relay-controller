@@ -6,4 +6,5 @@
 
  
 
+include/secrets.h
 compile_commands.json
