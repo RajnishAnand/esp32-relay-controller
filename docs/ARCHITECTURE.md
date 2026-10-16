@@ -1,0 +1,129 @@
+# Architecture
+
+## Modules
+
+| Module (`src/`) | Responsibility |
+|---|---|
+| `main.cpp` | Boot order and the main loop |
+| `config.h` (`include/`) | Compile-time tunables; selects secrets for development or release builds |
+| `storage` | The single NVS (`Preferences`) namespace, `relay` |
+| `credentials` | WiFi/AP/API credentials in NVS; seeds them from `secrets.h` in development builds |
+| `relays` | Relay state, pin driving, staggered switch-on, names |
+| `scheduler` | NTP time, daily schedules, catch-up, uptime stamping |
+| `network` | WiFi connect (static host address), fallback AP, background reconnect |
+| `ota` | Signed update check/install, boot trial and rollback |
+| `api` | HTTP server, authentication, validation, JSON |
+| `dashboard.h` | The single-page dashboard served from flash |
+| `util` | Pure helpers: parsing, validation, JSON escaping, semver, manifest parsing |
+| `led`, `platform`, `log.h` | Status LED, watchdog/reset/clock wrappers, logging macros |
+
+Dependencies point one way: `api` uses everything below it; `ota` is independent of `api` and is given a
+"pump" callback so the web server keeps running during a download.
+
+## Boot sequence
+
+1. Serial and NVS start.
+2. `ota::begin()` runs first: if the previous OTA image is still unconfirmed it counts this boot and may roll
+   back (see [OTA.md](OTA.md)).
+3. A 1 s settle delay lets power rails and the relay board stabilise before any pin is driven.
+4. LED starts; credentials are seeded (development builds only).
+5. `relays::begin()` writes the **inactive** level to each pin before switching it to output (to avoid a
+   spurious pulse on active-LOW boards), then restores the saved state. Relays that were on are switched on
+   one at a time, 400 ms apart. This call blocks until restore is complete (about 1.2 s worst case).
+6. Schedules load. `network::begin()` connects WiFi (blocking, up to roughly 20-60 s) or starts the fallback AP.
+7. The HTTP server starts and the task watchdog is armed.
+
+The API is therefore unreachable until step 7. While in step 6 the relays already hold their restored state.
+
+## Main loop
+
+One cooperative loop: HTTP requests, LED, scheduler, relay stagger, watchdog feed, WiFi monitor, OTA.
+Nothing runs concurrently. Long operations (WiFi connect, OTA check, OTA download) block the loop; OTA
+downloads call the same pump so the dashboard, schedules and relays keep working during a download.
+
+Timers use elapsed-time arithmetic (`millis() - since >= duration`) rather than absolute deadlines, which
+stay correct across `millis()` wrap and long uptimes.
+
+## Relays
+
+- `state` is the **commanded** state and is what is persisted.
+- Switching **off** is immediate and cancels a pending switch-on.
+- Switching **on** is queued; at most one relay is switched on per `kRelayStaggerMs`. `setAll(true)` on four
+  relays takes about 1.2 s to complete.
+- Outputs are active-LOW by default (`kRelayActiveLow`); the API always speaks logical on/off.
+
+## Scheduling
+
+Each relay has one daily schedule: enabled flag, on time, off time (device local time, `kGmtOffsetSec`,
+default UTC+5:30, no daylight-saving handling).
+
+- **Needs NTP.** Nothing happens until the clock has synchronised (a year-2023+ timestamp). Time does not
+  survive a power cut (no RTC). In fallback-AP mode without internet, schedules are inactive.
+- **Edge-triggered.** An event fires when the minute of day equals the on or off time. Between events the
+  relay keeps whatever state it has, including manual changes. If on and off times are equal, on wins.
+- **Skipped minutes are recovered.** If the loop was busy and minutes were skipped, each missed minute (up to
+  `kMaxScheduleGapMinutes`, 10) is processed in order. A larger jump or a clock moving backwards is not
+  replayed.
+- **Catch-up after a power outage.** The device records a "last alive" time in flash every 5 minutes and right
+  after any schedule event or schedule edit. At the first valid time after boot, for each enabled schedule it
+  finds the most recent event; if that event happened after the last-alive time, it was missed while powered
+  off and is applied once.
+  - Only the latest missed event per relay matters.
+  - A relay the user toggled after boot but before time sync is skipped.
+  - With no last-alive record (first boot of this firmware) nothing is caught up.
+  - Catch-up cannot run before NTP syncs, so after power returns relays sit in their saved state for the
+    sync delay (seconds, or indefinitely without internet) and then may change. A battery-backed RTC is the
+    only way to remove that window.
+  - Example: schedule off at 22:00, power out 21:50-22:30. After sync the 22:00 off event is
+    applied, so the load runs for a few seconds past power-up before switching off.
+
+## Network
+
+1. Connect with DHCP to learn the real gateway, subnet mask and DNS.
+2. If the mask is `255.255.255.0`, reconnect with the same network but the host address forced to
+   `kStaticHostOctet` (250). Other masks keep the DHCP address.
+3. If WiFi is not configured, or the connection fails, start a fallback access point `Relay-XXXX`
+   (XXXX derived from the chip ID) with the provisioned AP password, reachable at `192.168.4.1`. The AP is not
+   started if no valid AP password is provisioned.
+4. While disconnected the device retries every `kWifiRetryIntervalMs` (15 s) without blocking the web server.
+   When the station connects, the AP is shut down.
+
+Limits: the `.250` address is derived once at boot. If WiFi was unavailable at boot, the later background
+reconnect uses plain DHCP and the address may differ until the next reboot. No duplicate-address check is
+made; if `.250` is taken, reserve it on the router or choose another octet. Resilience beyond this
+(captive portal provisioning, mDNS) is not implemented.
+
+## Persistence (NVS namespace `relay`)
+
+| Key | Type | Meaning |
+|---|---|---|
+| `r0`-`r3` | bool | Commanded relay state |
+| `n0`-`n3` | string | Relay names |
+| `se`, `soh`, `som`, `sfh`, `sfm` + `0`-`3` | bool / uint8 | Schedule: enabled, on hour, on minute, off hour, off minute |
+| `alive` | uint32 | Last-alive epoch for catch-up |
+| `wifi_ssid`, `wifi_pass`, `ap_pass`, `api_token` | string | Credentials |
+| `ota_pend`, `ota_boots`, `ota_bad` | bool / uint8 / string | OTA trial state and last rolled-back version |
+
+NVS is not encrypted. Anyone with physical access can read the credentials from flash.
+
+## Status LED
+
+| LED | Meaning |
+|---|---|
+| Solid on | Not connected to your WiFi (includes fallback-AP mode) |
+| Short dim pulse about every 1.6 s | Connected to your WiFi |
+
+The LED pin is `kStatusLedPin` (GPIO 2). Some boards have no onboard LED or a different colour.
+
+## Watchdog
+
+`platform::beginWatchdog()` tries to arm a 60 s task watchdog on the main loop and feeds it from the loop and
+from every long-running wait. If it cannot be armed it logs a warning and the device runs without it. This
+has not been verified on hardware.
+
+## Known limits
+
+- Single-threaded; one long operation blocks everything else (except OTA download, which pumps).
+- One schedule per relay, daily, no weekdays.
+- No relay position feedback; the API reports the commanded state.
+- HTTP only, no TLS on the device's own server.
