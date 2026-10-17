@@ -3,8 +3,12 @@
 # Usage: tools/release.sh MAJOR.MINOR.PATCH   (see docs/OTA.md)
 set -euo pipefail
 
-VERSION="${1:?usage: tools/release.sh MAJOR.MINOR.PATCH}"
-[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "version must be MAJOR.MINOR.PATCH"; exit 1; }
+if [[ $# -ne 1 ]]; then
+  echo "usage: tools/release.sh MAJOR.MINOR.PATCH   (example: tools/release.sh 1.0.1)" >&2
+  exit 2
+fi
+VERSION="$1"
+[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "version must be MAJOR.MINOR.PATCH, got: $VERSION" >&2; exit 2; }
 
 KEY="${OTA_PRIVATE_KEY:-$HOME/.relay-ota/ota_private.pem}"
 PUB="${OTA_PUBLIC_KEY:-$HOME/.relay-ota/ota_public.pem}"
