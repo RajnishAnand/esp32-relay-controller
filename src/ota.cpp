@@ -5,10 +5,10 @@
 #include <WiFiClientSecure.h>
 #include <esp_ota_ops.h>
 #include <mbedtls/pk.h>
-#include <mbedtls/sha256.h>
 
 #include "config.h"
 #include "log.h"
+#include "mbedtls_compat.h"
 #include "network.h"
 #include "ota_config.h"
 #include "platform.h"
@@ -64,8 +64,7 @@ bool verifySignature(const uint8_t* data, size_t len, const uint8_t* sig, size_t
     return false;
   }
   uint8_t hash[32];
-  mbedtls_sha256(data, len, hash, 0);
-  rc = 0;
+  rc = mbedcompat::sha256(data, len, hash);
   if (rc == 0) rc = mbedtls_pk_verify(&pk, MBEDTLS_MD_SHA256, hash, sizeof(hash), sig, sigLen);
   mbedtls_pk_free(&pk);
   return rc == 0;
@@ -225,7 +224,7 @@ void runInstall() {
 
   mbedtls_sha256_context sha;
   mbedtls_sha256_init(&sha);
-  mbedtls_sha256_starts(&sha, 0);
+  mbedcompat::sha256Starts(&sha);
 
   static uint8_t buf[1024];
   WiFiClient* stream = http.getStreamPtr();
@@ -245,7 +244,7 @@ void runInstall() {
         error = "Download read error";
         break;
       }
-      mbedtls_sha256_update(&sha, buf, n);
+      mbedcompat::sha256Update(&sha, buf, n);
       if (Update.write(buf, n) != n) {
         error = "Flash write failed";
         break;
@@ -268,7 +267,7 @@ void runInstall() {
   http.end();
 
   uint8_t digest[32];
-  mbedtls_sha256_finish(&sha, digest);
+  mbedcompat::sha256Finish(&sha, digest);
   mbedtls_sha256_free(&sha);
 
   if (error != nullptr) {

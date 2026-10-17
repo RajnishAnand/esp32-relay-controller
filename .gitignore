@@ -1,4 +1,5 @@
 # PlatformIO build output and tooling caches
+.pio
 .pioenvs/
 .piolibdeps/
 .clang_complete
