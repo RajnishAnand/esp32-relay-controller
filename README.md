@@ -1,7 +1,7 @@
 # ESP32 Relay Controller
 
 Firmware for an ESP32 (WROOM-32) driving a 4-channel relay module, with a web dashboard, an HTTP API
-for automation and agents, daily schedules, and signed over-the-air updates from GitHub releases.
+for automation and agents, daily schedules, and signed over-the-air updates from GitHub releases. 
 
 > **Mains safety.** If these relays switch mains voltage, the wiring must be done by a qualified person in
 > a proper enclosure. This project is software; it cannot make unsafe wiring safe. See
