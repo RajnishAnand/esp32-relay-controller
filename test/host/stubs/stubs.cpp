@@ -35,21 +35,53 @@ void EspStub::restart() { g_restarts++; }
 WiFiClass WiFi;
 wl_status_t g_wifiStatus = WL_CONNECTED;
 IPAddress g_wifiIp(192, 168, 1, 50);
+std::map<std::string, std::string> g_wifiNetworks;
+std::vector<ScanEntry> g_scanEntries;
+int g_scanState = WIFI_SCAN_FAILED;
+int g_scanStarts = 0;
+int g_softApStarts = 0;
+int g_softApStops = 0;
+std::string g_lastBeginSsid;
 bool WiFiClass::mode(WiFiMode_t) { return true; }
-void WiFiClass::begin(const char*, const char*) {}
-bool WiFiClass::config(IPAddress ip, IPAddress, IPAddress, IPAddress) {
-  g_wifiIp = ip;
+void WiFiClass::begin(const char* ssid, const char* pass) {
+  g_lastBeginSsid = ssid;
+  std::map<std::string, std::string>::iterator it = g_wifiNetworks.find(ssid);
+  bool ok = g_wifiNetworks.empty() || (it != g_wifiNetworks.end() && it->second == pass);
+  g_wifiStatus = ok ? WL_CONNECTED : WL_DISCONNECTED;
+}
+bool WiFiClass::config(IPAddress ip, IPAddress, IPAddress, IPAddress, IPAddress) {
+  g_wifiIp = (ip == IPAddress(0, 0, 0, 0)) ? IPAddress(192, 168, 1, 50) : ip;
   return true;
 }
-bool WiFiClass::disconnect(bool) { return true; }
+bool WiFiClass::disconnect(bool) {
+  g_wifiStatus = WL_DISCONNECTED;
+  return true;
+}
 wl_status_t WiFiClass::status() { return g_wifiStatus; }
 IPAddress WiFiClass::localIP() { return g_wifiIp; }
 IPAddress WiFiClass::gatewayIP() { return IPAddress(192, 168, 1, 1); }
 IPAddress WiFiClass::subnetMask() { return IPAddress(255, 255, 255, 0); }
 IPAddress WiFiClass::dnsIP() { return IPAddress(192, 168, 1, 1); }
 IPAddress WiFiClass::softAPIP() { return IPAddress(192, 168, 4, 1); }
-bool WiFiClass::softAP(const char*, const char*) { return true; }
-bool WiFiClass::softAPdisconnect(bool) { return true; }
+bool WiFiClass::softAP(const char*, const char*) {
+  g_softApStarts++;
+  return true;
+}
+bool WiFiClass::softAPdisconnect(bool) {
+  g_softApStops++;
+  return true;
+}
+int16_t WiFiClass::scanNetworks(bool async, bool, bool, uint32_t, uint8_t, const char*, const uint8_t*) {
+  g_scanStarts++;
+  g_scanState = async ? WIFI_SCAN_RUNNING : (int)g_scanEntries.size();
+  return (int16_t)g_scanState;
+}
+int16_t WiFiClass::scanComplete() { return (int16_t)g_scanState; }
+void WiFiClass::scanDelete() { g_scanState = WIFI_SCAN_FAILED; }
+String WiFiClass::SSID(uint8_t i) { return String(g_scanEntries[i].ssid.c_str()); }
+int WiFiClass::RSSI(uint8_t i) { return g_scanEntries[i].rssi; }
+wifi_auth_mode_t WiFiClass::encryptionType(uint8_t i) { return (wifi_auth_mode_t)g_scanEntries[i].enc; }
+int WiFiClass::channel(uint8_t i) { return g_scanEntries[i].channel; }
 void WiFiClass::persistent(bool) {}
 int WiFiClass::RSSI() { return -55; }
 void WiFiClientSecure::setInsecure() {}
@@ -77,6 +109,7 @@ size_t Preferences::putString(const char* k, String v) {
   g_nvs[k] = v.s;
   return v.length();
 }
+bool Preferences::remove(const char* k) { return g_nvs.erase(k) > 0; }
 
 std::map<std::string, std::string> g_files;
 static std::string curData;

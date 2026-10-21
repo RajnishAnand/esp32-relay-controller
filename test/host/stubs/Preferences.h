@@ -14,4 +14,5 @@ class Preferences {
   size_t putULong(const char*, uint32_t);
   String getString(const char*, String = String());
   size_t putString(const char*, String);
+  bool remove(const char*);
 };

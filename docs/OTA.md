@@ -69,7 +69,7 @@ in the device's flash, put there by the USB-flashed development build; an OTA up
   one running. Do not leave a known-bad release published; delete it.
 - **No Secure Boot or flash encryption.** Stock Arduino builds do not enable them, so physical access still
   allows reflashing and reading the credentials.
-- **Triggering:** anyone with the API token can trigger an install of the latest genuine release.
+- **Triggering:** anyone with the admin token can trigger an install (guests cannot) of the latest genuine release.
 
 ## Rollback
 

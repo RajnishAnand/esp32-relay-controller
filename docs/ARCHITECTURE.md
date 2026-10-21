@@ -7,12 +7,12 @@
 | `main.cpp` | Boot order and the main loop |
 | `config.h` (`include/`) | Compile-time tunables; selects secrets for development or release builds |
 | `storage` | The single NVS (`Preferences`) namespace, `relay` |
-| `credentials` | WiFi/AP/API credentials in NVS; seeds them from `secrets.h` in development builds |
+| `credentials` | WiFi, AP, admin token and guest password in NVS; seeds from `secrets.h` in development builds when it has changed |
 | `relays` | Relay state, pin driving, staggered switch-on, names |
 | `scheduler` | NTP time, daily schedules, catch-up, uptime stamping |
 | `network` | WiFi connect (static host address), fallback AP, background reconnect |
 | `ota` | Signed update check/install, boot trial and rollback |
-| `api` | HTTP server, authentication, validation, JSON |
+| `api` | HTTP server, roles and authentication, validation, JSON |
 | `dashboard.h` | The single-page dashboard served from flash |
 | `util` | Pure helpers: parsing, validation, JSON escaping, semver, manifest parsing |
 | `led`, `platform`, `log.h` | Status LED, watchdog/reset/clock wrappers, logging macros |
@@ -88,6 +88,34 @@ default UTC+5:30, no daylight-saving handling).
 4. While disconnected the device retries every `kWifiRetryIntervalMs` (15 s) without blocking the web server.
    When the station connects, the AP is shut down.
 
+### Changing the network at runtime
+
+`POST /api/wifi/connect` only queues the request; `network::loop()` performs it:
+
+1. Start the fallback AP (if an AP password is provisioned) so there is a way back in, and leave the current network.
+2. Connect to the new network with DHCP, then take the `.250` host address as at boot.
+3. **Success:** save the new credentials, stop the AP, report `succeeded`. **Failure:** do not save anything,
+   reconnect to the previous network, report `failed` with a message.
+
+Connecting can take well over 20 s (two attempts per network). During it the main-loop pump keeps the web
+server, schedules and relays running, and the watchdog is fed. Credentials are written only after a
+successful connection, so a typo cannot overwrite a working configuration.
+
+Scanning (`POST /api/wifi/scan`) is asynchronous: the radio scans in the background and `GET` reads the result.
+Results are deduplicated, sorted strongest first and capped; names that are empty or not valid UTF-8 are dropped
+so the JSON stays valid.
+
+## Roles and authentication
+
+One `X-API-Key` header, two credentials. The device compares the value, in constant time, against the admin
+token and then the guest password, and the endpoint table in [API_CAPABILITIES.md](API_CAPABILITIES.md) says
+what each role may call. Missing or wrong credentials get `401`; a guest on an admin endpoint gets `403`; no
+valid admin token stored gets `503` for everyone.
+
+Failed guest attempts are counted globally: 8 failures pause *guest* login for 60 s (a fixed window, not extended
+by further attempts). The admin comparison always happens first and is never throttled. A request with no header
+is not counted. A guest password cannot equal the admin token.
+
 Limits: the `.250` address is derived once at boot. If WiFi was unavailable at boot, the later background
 reconnect uses plain DHCP and the address may differ until the next reboot. No duplicate-address check is
 made; if `.250` is taken, reserve it on the router or choose another octet. Resilience beyond this
@@ -101,7 +129,10 @@ made; if `.250` is taken, reserve it on the router or choose another octet. Resi
 | `n0`-`n3` | string | Relay names |
 | `se`, `soh`, `som`, `sfh`, `sfm` + `0`-`3` | bool / uint8 | Schedule: enabled, on hour, on minute, off hour, off minute |
 | `alive` | uint32 | Last-alive epoch for catch-up |
-| `wifi_ssid`, `wifi_pass`, `ap_pass`, `api_token` | string | Credentials |
+| `wifi_ssid`, `wifi_pass` | string | Saved WiFi network (seeded from `secrets.h`, changeable over the API) |
+| `ap_pass`, `api_token` | string | Fallback AP password and admin token (seeded from `secrets.h`) |
+| `guest_pass` | string | Guest password, set by an admin |
+| `seed_hash` | uint32 | Hash of the `secrets.h` values last seeded, so unchanged secrets never overwrite API changes |
 | `ota_pend`, `ota_boots`, `ota_bad` | bool / uint8 / string | OTA trial state and last rolled-back version |
 
 NVS is not encrypted. Anyone with physical access can read the credentials from flash.

@@ -39,6 +39,7 @@ void setup() {
   network::begin();
   api::begin();
   ota::setPump(pump);
+  network::setPump(pump);
   platform::beginWatchdog();
 }
 

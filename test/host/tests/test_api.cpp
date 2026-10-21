@@ -8,37 +8,7 @@
 #include "../../../src/scheduler.h"
 #include "testlib.h"
 
-static const char* kToken = "0123456789abcdef0123456789abcdef";
-typedef std::map<std::string, std::string> Args;
-
-static void boot() {
-  g_nvs["api_token"] = kToken;
-  relays::begin();
-  scheduler::begin();
-  network::begin();
-  api::begin();
-}
-
-static HttpResponse call(HTTPMethod method, const char* uri, const Args& args = Args(), const char* token = kToken) {
-  WebServer* s = WebServer::instance;
-  s->args = args;
-  s->headers.clear();
-  if (token) s->headers["X-API-Key"] = token;
-  return s->perform(method, uri);
-}
-
-static Args args(const char* k1, const char* v1, const char* k2 = nullptr, const char* v2 = nullptr,
-                 const char* k3 = nullptr, const char* v3 = nullptr, const char* k4 = nullptr,
-                 const char* v4 = nullptr) {
-  Args a;
-  a[k1] = v1;
-  if (k2) a[k2] = v2;
-  if (k3) a[k3] = v3;
-  if (k4) a[k4] = v4;
-  return a;
-}
-
-static bool has(const std::string& text, const char* part) { return text.find(part) != std::string::npos; }
+#include "api_helpers.h"
 
 TEST(api_requires_the_token) {
   boot();
@@ -51,10 +21,15 @@ TEST(api_requires_the_token) {
 
 TEST(api_requires_the_token_on_every_api_route) {
   boot();
-  const char* routes[] = {"/api/status", "/api/info", "/api/set", "/api/all", "/api/rename", "/api/schedule"};
+  const char* routes[] = {"/api/status", "/api/info", "/api/set", "/api/all", "/api/rename", "/api/schedule",
+                          "/api/guest", "/api/wifi/status", "/api/wifi/scan"};
   for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++)
     CHECK(call(HTTP_GET, routes[i], Args(), nullptr).code == 401);
   CHECK(call(HTTP_POST, "/api/update/check", Args(), nullptr).code == 401);
+  CHECK(call(HTTP_POST, "/api/guest/password", Args(), nullptr).code == 401);
+  CHECK(call(HTTP_POST, "/api/guest/disable", Args(), nullptr).code == 401);
+  CHECK(call(HTTP_POST, "/api/wifi/scan", Args(), nullptr).code == 401);
+  CHECK(call(HTTP_POST, "/api/wifi/connect", Args(), nullptr).code == 401);
   CHECK(call(HTTP_POST, "/api/update/apply", Args(), nullptr).code == 401);
   CHECK(call(HTTP_GET, "/api/update/status", Args(), nullptr).code == 401);
 }

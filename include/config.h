@@ -41,6 +41,9 @@ constexpr unsigned long kAliveStampIntervalMs = 300000;
 constexpr long kMaxScheduleGapMinutes = 10;
 
 constexpr size_t kNameMaxLen = 24;
+constexpr uint8_t kGuestMaxFailures = 8;
+constexpr unsigned long kGuestLockoutMs = 60000;
+constexpr size_t kScanMaxResults = 20;
 constexpr uint32_t kWatchdogTimeoutS = 60;
 
 constexpr unsigned long kOtaAutoCheckIntervalMs = 6UL * 3600UL * 1000UL;

@@ -112,3 +112,26 @@ TEST(util_manifest_and_hex) {
   CHECK(!util::hexToBytes("zz00", out, 2));
   CHECK(!util::hexToBytes("00", out, 2));
 }
+
+TEST(util_wifi_and_guest_validators) {
+  CHECK(util::validSsid("Home Wi-Fi"));
+  CHECK(util::validSsid(String(std::string(32, 'a').c_str())));
+  CHECK(!util::validSsid(String(std::string(33, 'a').c_str())));
+  CHECK(!util::validSsid(""));
+  CHECK(!util::validSsid("bad\x01"));
+  CHECK(!util::validSsid("bad\xFF"));
+  CHECK(util::validWifiPassword(""));
+  CHECK(util::validWifiPassword("12345678"));
+  CHECK(util::validWifiPassword(String(std::string(63, 'a').c_str())));
+  CHECK(!util::validWifiPassword("1234567"));
+  CHECK(!util::validWifiPassword(String(std::string(64, 'a').c_str())));
+  CHECK(util::validWifiPassword(" spaced pass "));
+  CHECK(util::validGuestPassword("guest-pass-1234"));
+  CHECK(!util::validGuestPassword("short"));
+  CHECK(!util::validGuestPassword(" leading-space1"));
+  CHECK(!util::validGuestPassword("trailing-space1 "));
+  CHECK(util::validGuestPassword(String(std::string(64, 'a').c_str())));
+  CHECK(!util::validGuestPassword(String(std::string(65, 'a').c_str())));
+  CHECK(util::hasControlChars("a\tb"));
+  CHECK(!util::hasControlChars("plain"));
+}

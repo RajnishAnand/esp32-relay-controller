@@ -89,14 +89,36 @@ bool isValidUtf8(const String& text) {
   return true;
 }
 
-bool validName(const String& text) {
+bool hasControlChars(const String& text) {
   size_t len = text.length();
-  if (len == 0 || len > cfg::kNameMaxLen) return false;
   for (size_t i = 0; i < len; i++) {
     uint8_t c = (uint8_t)text[i];
-    if (c < 0x20 || c == 0x7F) return false;
+    if (c < 0x20 || c == 0x7F) return true;
   }
-  return isValidUtf8(text);
+  return false;
+}
+
+bool validName(const String& text) {
+  size_t len = text.length();
+  return len >= 1 && len <= cfg::kNameMaxLen && !hasControlChars(text) && isValidUtf8(text);
+}
+
+bool validSsid(const String& text) {
+  size_t len = text.length();
+  return len >= 1 && len <= 32 && !hasControlChars(text) && isValidUtf8(text);
+}
+
+bool validWifiPassword(const String& text) {
+  size_t len = text.length();
+  if (len == 0) return true;
+  return len >= 8 && len <= 63 && !hasControlChars(text) && isValidUtf8(text);
+}
+
+bool validGuestPassword(const String& text) {
+  size_t len = text.length();
+  if (len < 8 || len > 64) return false;
+  if (text[0] == ' ' || text[len - 1] == ' ') return false;
+  return !hasControlChars(text) && isValidUtf8(text);
 }
 
 String jsonEscape(const String& text) {

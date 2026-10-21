@@ -4,6 +4,33 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **Roles:** the flashed token is now the *admin* credential; admins can set a *guest* password. Guests can view
+  status and switch relays (`/api/status`, `/api/set`, `/api/all`) and nothing else. `GET /api/status` reports the
+  caller's `role`.
+- **Guest password management:** `GET /api/guest`, `POST /api/guest/password`, `POST /api/guest/disable`.
+- **Guest brute-force throttle:** 8 failed guest attempts pause guest login for 60 s; admin is unaffected.
+- **WiFi over the API and dashboard:** `POST`/`GET /api/wifi/scan`, `GET /api/wifi/status`,
+  `POST /api/wifi/connect`. A switch saves the new credentials only after it connects, and reverts to the
+  previous network on failure. A device with no network can be provisioned through its access point.
+- Dashboard: role-aware layout, WiFi scan/connect, guest password controls, error messages from the device.
+- Dashboard tests that run the real page in jsdom (18 tests), and 29 more host tests (93 total).
+
+### Changed
+- `/api/info` and the `/api/update/*` endpoints are admin-only (they always needed the only credential that
+  existed; guests are refused).
+- Development builds seed credentials from `secrets.h` only when it has changed, so a WiFi change made over the
+  API is not undone by re-flashing unchanged secrets.
+- The dashboard is rewritten in plain HTML (about 10 KB, down from 13 KB, with more features).
+
+### Fixed
+- Host tests failed to build on systems with mbedtls 3.x (for example Arch), which removed the `_ret` SHA-256
+  functions. `src/mbedtls_compat.h` selects the right names; verified against mbedtls 2.28.8 and 3.6.2.
+- `make -C test/host` now checks for its prerequisites and prints the install command instead of failing
+  with a compiler error.
+
 ## [1.0.0]
 
 First production-oriented release.

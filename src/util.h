@@ -6,7 +6,11 @@ namespace util {
 bool parseRelayIndex(const String& text, uint8_t& index);
 bool parseBool(const String& text, bool& value);
 bool parseHHMM(const String& text, uint8_t& hour, uint8_t& minute);
+bool hasControlChars(const String& text);
 bool validName(const String& text);
+bool validSsid(const String& text);
+bool validWifiPassword(const String& text);
+bool validGuestPassword(const String& text);
 bool isValidUtf8(const String& text);
 String jsonEscape(const String& text);
 bool constantTimeEquals(const String& a, const String& b);
