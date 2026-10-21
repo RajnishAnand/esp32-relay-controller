@@ -5,7 +5,7 @@ for automation and agents, daily schedules, and signed over-the-air updates from
 
 > **Mains safety.** If these relays switch mains voltage, the wiring must be done by a qualified person in
 > a proper enclosure. This project is software; it cannot make unsafe wiring safe. See
-> [docs/HARDWARE.md](docs/HARDWARE.md).
+> [docs/HARDWARE.md](docs/HARDWARE.md). 
 
 ## Features
 
