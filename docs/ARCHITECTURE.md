@@ -37,9 +37,25 @@ The API is therefore unreachable until step 7. While in step 6 the relays alread
 
 ## Main loop
 
-One cooperative loop: HTTP requests, LED, scheduler, relay stagger, watchdog feed, WiFi monitor, OTA.
-Nothing runs concurrently. Long operations (WiFi connect, OTA check, OTA download) block the loop; OTA
-downloads call the same pump so the dashboard, schedules and relays keep working during a download.
+One cooperative loop on the Arduino loop task: HTTP requests, LED, scheduler, relay stagger, watchdog feed,
+WiFi monitor, OTA bookkeeping. The loop must stay short, because the HTTP server is single-threaded and only
+serves a request when the loop reaches it.
+
+Operations that can take many seconds are kept off the loop:
+
+| Operation | Where it runs |
+|---|---|
+| Update check, update download and flash write | A background task (`ota-check` / `ota-install`, pinned to core 0, 16 KB stack, created per request and deleted when done). Each TLS handshake takes seconds and a check makes several, so this must not run on the loop |
+| WiFi scan | Asynchronous in the radio driver; the loop only reads the result |
+| WiFi network change, boot-time connect | On the loop, but with the pump so requests keep being served (the boot connect runs before the server starts) |
+
+The OTA task and the loop share the OTA state behind a mutex (`platform::Mutex`). The task writes results in one
+step after its network I/O, never while holding the lock across a network call. Persistent storage (NVS) is safe
+to use from both. `GET /api/info` reports `loopMaxMs`, the longest the loop has ever taken, so a blocked loop is
+visible.
+
+WiFi modem sleep is turned off (`WiFi.setSleep(false)`): the default power saving adds latency and can make an
+always-on server miss incoming connections. The device is mains powered, so the power cost does not matter.
 
 Timers use elapsed-time arithmetic (`millis() - since >= duration`) rather than absolute deadlines, which
 stay correct across `millis()` wrap and long uptimes.
@@ -104,6 +120,14 @@ successful connection, so a typo cannot overwrite a working configuration.
 Scanning (`POST /api/wifi/scan`) is asynchronous: the radio scans in the background and `GET` reads the result.
 Results are deduplicated, sorted strongest first and capped; names that are empty or not valid UTF-8 are dropped
 so the JSON stays valid.
+
+The ESP32 radio cannot scan while it is trying to connect. If the device is not connected, starting a scan
+cancels the pending connection attempt, turns driver auto-reconnect off, and pauses the 15 s retry timer until
+the scan ends; then both are restored. If the device is connected it is left alone. A scan that the radio refuses
+to start is reported (`409`) rather than silently doing nothing. Each channel is listened to for 150 ms
+(`kScanDwellMs`) to keep the time away from your channel short; weak distant networks can be missed. Scanning
+still takes the radio off the channel it is using for a moment, so a dashboard on the same radio may pause for
+a second or two.
 
 ## Roles and authentication
 

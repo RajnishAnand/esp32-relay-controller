@@ -45,16 +45,37 @@ h3{margin:1em 0 .3em}.e{color:#b00}small{color:#666}
 <script>
 const $ = id => document.getElementById(id);
 const BUSY = ['checking', 'downloading', 'verifying', 'rebooting'];
+const TIMEOUT_MS = 12000;
 let tok = load(), data = null, role = null, ver = null, st = null, fast = null;
+const running = {};
 
 function load() { try { return localStorage.getItem('relayToken') || ''; } catch (e) { return ''; } }
 function store(v) { try { v ? localStorage.setItem('relayToken', v) : localStorage.removeItem('relayToken'); } catch (e) {} }
 function msg(t, err) { const m = $('msg'); m.textContent = t; m.className = err ? 'e' : ''; }
 function h(tag, props, ...kids) { const e = document.createElement(tag); Object.assign(e, props); e.append(...kids); return e; }
-function fail(e) { if (e.message !== 'auth') msg(e.message, 1); }
+function fail(e) {
+  if (e.message === 'auth') return;
+  if (e.message === 'timeout') msg('The device did not answer in time. It may be busy; try again in a moment.', 1);
+  else if (e.message === 'network') msg('Cannot reach the device.', 1);
+  else msg(e.message, 1);
+}
+function once(name, fn) {
+  return async function () {
+    if (running[name]) return;
+    running[name] = true;
+    try { await fn(); } finally { running[name] = false; }
+  };
+}
 
 async function api(path, method, body) {
-  const r = await fetch(path, { method: method || 'GET', headers: { 'X-API-Key': tok }, body: body ? new URLSearchParams(body) : undefined });
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), TIMEOUT_MS);
+  let r;
+  try {
+    r = await fetch(path, { method: method || 'GET', headers: { 'X-API-Key': tok }, body: body ? new URLSearchParams(body) : undefined, signal: ctl.signal });
+  } catch (e) {
+    throw new Error(e.name === 'AbortError' ? 'timeout' : 'network');
+  } finally { clearTimeout(timer); }
   if (r.status === 401) { $('login').hidden = false; msg(tok ? 'Invalid token or password' : 'Token or password required', 1); throw new Error('auth'); }
   if (r.status === 429) { msg('Too many failed attempts. Wait a minute.', 1); throw new Error('auth'); }
   if (r.status === 503) { msg('Device not provisioned', 1); throw new Error('auth'); }
@@ -68,7 +89,7 @@ async function call(path, method, body) {
   return r;
 }
 
-async function refresh() {
+const refreshOnce = once('refresh', async () => {
   try {
     data = await (await api('/api/status')).json();
     role = data.role;
@@ -77,8 +98,12 @@ async function refresh() {
     render();
     msg('');
     if (role === 'admin' && ver === null) update();
-  } catch (e) { if (e.message !== 'auth') msg('Disconnected, retrying...', 1); }
-}
+  } catch (e) {
+    if (e.message === 'timeout') fail(e);
+    else if (e.message !== 'auth') msg('Disconnected, retrying...', 1);
+  }
+});
+function refresh() { return refreshOnce(); }
 
 function render() {
   const ul = $('list');
@@ -133,12 +158,14 @@ async function wifiStatus() {
 }
 
 async function wifiScan() {
-  try {
-    await call('/api/wifi/scan', 'POST');
-    msg('Scanning...');
-    for (let i = 0; i < 20; i++) {
-      await new Promise(r => setTimeout(r, 1500));
+  try { await call('/api/wifi/scan', 'POST'); } catch (e) { fail(e); return; }
+  msg('Scanning... the connection may pause for a few seconds.');
+  let errors = 0;
+  for (let i = 0; i < 30; i++) {
+    await new Promise(r => setTimeout(r, 1500));
+    try {
       const s = await (await call('/api/wifi/scan')).json();
+      errors = 0;
       if (s.state === 'done') {
         const dl = $('wl');
         dl.textContent = '';
@@ -146,10 +173,13 @@ async function wifiScan() {
         msg(s.networks.length + ' networks found. Pick one in the name box.');
         return;
       }
-      if (s.state === 'idle') break;
+      if (s.state === 'idle') { msg('Scan failed. Try again.', 1); return; }
+    } catch (e) {
+      if (e.message === 'auth') return;
+      if (++errors >= 5) { fail(e); return; }
     }
-    msg('Scan failed', 1);
-  } catch (e) { fail(e); }
+  }
+  msg('Scan timed out. Try again.', 1);
 }
 
 async function wifiConnect() {
@@ -183,7 +213,7 @@ async function disableGuest() {
 function saveTok() { tok = $('tok').value.trim(); store(tok); $('tok').value = ''; ver = null; refresh(); }
 function forget() { tok = ''; store(''); role = null; ver = null; $('set').open = false; $('set').hidden = true; $('list').textContent = ''; $('who').textContent = ''; $('login').hidden = false; msg('Signed out'); }
 
-async function update() {
+const updateOnce = once('update', async () => {
   if (role !== 'admin') return;
   try {
     const u = await (await api('/api/update/status')).json();
@@ -193,7 +223,8 @@ async function update() {
     showUpdate(u);
   } catch (e) {}
   if (BUSY.includes(st) && !fast) fast = setTimeout(() => { fast = null; update(); }, 1000);
-}
+});
+function update() { return updateOnce(); }
 
 function showUpdate(u) {
   const b = $('upd');

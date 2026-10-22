@@ -28,6 +28,8 @@ struct WiFiClass {
   bool softAP(const char*, const char*);
   bool softAPdisconnect(bool = false);
   void persistent(bool);
+  bool setSleep(bool enabled);
+  void setAutoReconnect(bool enabled);
   int RSSI();
   int16_t scanNetworks(bool async = false, bool showHidden = false, bool passive = false, uint32_t maxMsPerChan = 300,
                        uint8_t channel = 0, const char* ssid = nullptr, const uint8_t* bssid = nullptr);
@@ -48,6 +50,12 @@ extern int g_scanStarts;
 extern int g_softApStarts;
 extern int g_softApStops;
 extern std::string g_lastBeginSsid;
+extern int g_beginCalls;
+extern int g_wifiDisconnects;
+extern bool g_wifiSleep;
+extern bool g_autoReconnect;
+extern bool g_scanStartFails;
+extern uint32_t g_lastScanDwell;
 
 class WiFiClient {
  public:

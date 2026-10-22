@@ -17,6 +17,8 @@ extern int g_failures;
 extern time_t g_epoch;
 extern int g_feeds;
 extern std::string g_fixtureDir;
+extern bool g_taskStartFails;
+void runTasks();
 
 struct TestCase {
   const char* name;

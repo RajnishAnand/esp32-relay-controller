@@ -5,6 +5,8 @@
 enum followRedirects_t { HTTPC_DISABLE_FOLLOW_REDIRECTS, HTTPC_STRICT_FOLLOW_REDIRECTS, HTTPC_FORCE_FOLLOW_REDIRECTS };
 
 extern std::map<std::string, std::string> g_files;
+extern int g_httpForceError;
+extern bool g_chunked;
 
 class HTTPClient {
  public:
@@ -16,4 +18,6 @@ class HTTPClient {
   WiFiClient* getStreamPtr();
   void end();
   bool connected();
+  String getString();
+  static String errorToString(int error);
 };

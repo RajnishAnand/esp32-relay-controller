@@ -117,6 +117,9 @@ TEST(api_info_reports_device_state) {
   CHECK(has(r.body, "\"firmware\":\"1.0.0\""));
   CHECK(has(r.body, "\"synced\":false"));
   CHECK(has(r.body, "\"relayCount\":4"));
+  CHECK(has(r.body, "\"minFreeHeap\":90000"));
+  CHECK(has(r.body, "\"maxAllocHeap\":60000"));
+  CHECK(has(r.body, "\"loopMaxMs\":"));
   g_epoch = localEpoch(2026, 1, 5, 14, 3, 0);
   scheduler::loop();
   r = call(HTTP_GET, "/api/info");

@@ -93,6 +93,8 @@ extern SerialStub Serial;
 struct EspStub {
   void restart();
   uint32_t getFreeHeap() { return 123456; }
+  uint32_t getMinFreeHeap() { return 90000; }
+  uint32_t getMaxAllocHeap() { return 60000; }
   uint64_t getEfuseMac() { return 0x112233445566ULL; }
 };
 extern EspStub ESP;

@@ -19,7 +19,6 @@ struct Status {
 
 void begin();
 void loop();
-void setPump(void (*pump)());
 bool requestCheck();
 bool requestApply();
 Status status();

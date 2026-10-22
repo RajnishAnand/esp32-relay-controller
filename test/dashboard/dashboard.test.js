@@ -1,4 +1,5 @@
 const test = require('node:test');
+const { afterEach } = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -30,6 +31,15 @@ function makeDevice(overrides) {
     const key = (opts.headers || {})['X-API-Key'] || '';
     const u = new URL(url, 'http://device');
     d.calls.push({ path: u.pathname, search: u.search, method: opts.method || 'GET', key, body: opts.body ? Object.fromEntries(opts.body) : null });
+    if (d.hang && u.pathname === '/api/status') {
+      return new Promise((_, reject) => {
+        if (opts.signal) opts.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
+      });
+    }
+    if (d.scanFailures > 0 && u.pathname === '/api/wifi/scan' && opts.method !== 'POST') {
+      d.scanFailures--;
+      throw new TypeError('network error');
+    }
     const isAdmin = key === ADMIN;
     const isGuest = d.guestEnabled && key === GUEST;
     if (!isAdmin && !isGuest) return reply(d.locked && key ? 429 : 401, 'denied');
@@ -41,7 +51,7 @@ function makeDevice(overrides) {
     if (p === '/api/rename') return d.renameError ? reply(400, d.renameError) : reply(200, 'ok');
     if (p === '/api/schedule') return reply(200, 'ok');
     if (p === '/api/wifi/status') return reply(200, d.wifi);
-    if (p === '/api/wifi/scan') return reply(200, opts.method === 'POST' ? 'ok' : d.scan);
+    if (p === '/api/wifi/scan') return opts.method === 'POST' ? (d.scanRefuse ? reply(409, 'scan could not start (busy or radio unavailable), try again') : reply(200, 'ok')) : reply(200, d.scan);
     if (p === '/api/wifi/connect') return reply(200, 'ok');
     if (p === '/api/guest') return reply(200, { enabled: d.guestEnabled });
     if (p === '/api/guest/password') return reply(200, 'ok');
@@ -53,6 +63,9 @@ function makeDevice(overrides) {
   return d;
 }
 
+const opened = [];
+afterEach(() => { while (opened.length) opened.pop().window.close(); });
+
 async function open(device, token) {
   const dom = new JSDOM(HTML, {
     url: 'http://localhost/', runScripts: 'dangerously', pretendToBeVisual: true,
@@ -60,10 +73,11 @@ async function open(device, token) {
       window.fetch = device.fetch;
       window.confirm = () => true;
       const original = window.setTimeout.bind(window);
-      window.setTimeout = (fn, ms, ...args) => original(fn, Math.min(ms || 0, 5), ...args);
+      window.setTimeout = (fn, ms, ...args) => original(fn, ms === 12000 ? 25 : Math.min(ms || 0, 5), ...args);
       if (token) window.localStorage.setItem('relayToken', token);
     },
   });
+  opened.push(dom);
   await sleep(60);
   return dom;
 }
@@ -274,5 +288,61 @@ test('signing out clears the token and the screen', async () => {
   assert.strictEqual($(dom, 'list').children.length, 0);
   assert.strictEqual($(dom, 'login').hidden, false);
   assert.strictEqual($(dom, 'set').hidden, true);
+  dom.window.close();
+});
+
+test('a request that never answers times out with a clear message', async () => {
+  const d = makeDevice({ hang: true });
+  const dom = await open(d, ADMIN);
+  await sleep(120);
+  assert.match($(dom, 'msg').textContent, /did not answer in time/);
+  dom.window.close();
+});
+
+test('polling does not pile up requests while the device is not answering', async () => {
+  const d = makeDevice({ hang: true });
+  const dom = await open(d, ADMIN);
+  const statusCalls = () => d.calls.filter(c => c.path === '/api/status').length;
+  const before = statusCalls();
+  for (let i = 0; i < 6; i++) dom.window.refresh();
+  await sleep(10);
+  assert.strictEqual(statusCalls() - before, 1);
+  await sleep(100);
+  dom.window.refresh();
+  await sleep(10);
+  assert.strictEqual(statusCalls() - before, 2);
+});
+
+test('a wifi scan survives transient failures while the radio is busy', async () => {
+  const d = makeDevice({ scanFailures: 3 });
+  const dom = await open(d, ADMIN);
+  await dom.window.wifiScan();
+  assert.deepStrictEqual([...$(dom, 'wl').querySelectorAll('option')].map(o => o.value), ['Cafe', 'Open']);
+  dom.window.close();
+});
+
+test('a wifi scan gives up with a message after repeated failures', async () => {
+  const d = makeDevice({ scanFailures: 50 });
+  const dom = await open(d, ADMIN);
+  await dom.window.wifiScan();
+  assert.match($(dom, 'msg').textContent, /Cannot reach the device/);
+  dom.window.close();
+});
+
+test('a scan the device refuses shows the reason', async () => {
+  const d = makeDevice({ scanRefuse: true });
+  const dom = await open(d, ADMIN);
+  await dom.window.wifiScan();
+  assert.match($(dom, 'msg').textContent, /scan could not start/);
+  assert.ok(!d.calls.some(c => c.path === '/api/wifi/scan' && c.method === 'GET'));
+  dom.window.close();
+});
+
+test('a scan that reports idle is shown as failed', async () => {
+  const d = makeDevice();
+  d.scan = { state: 'idle', networks: [] };
+  const dom = await open(d, ADMIN);
+  await dom.window.wifiScan();
+  assert.match($(dom, 'msg').textContent, /Scan failed/);
   dom.window.close();
 });

@@ -183,6 +183,9 @@ void handleInfo() {
   String json = "{\"firmware\":\"" + String(FIRMWARE_VERSION) + "\"";
   json += ",\"uptimeSeconds\":" + String((unsigned long)(millis() / 1000UL));
   json += ",\"freeHeap\":" + String((unsigned long)platform::freeHeap());
+  json += ",\"minFreeHeap\":" + String((unsigned long)platform::minFreeHeap());
+  json += ",\"maxAllocHeap\":" + String((unsigned long)platform::maxAllocHeap());
+  json += ",\"loopMaxMs\":" + String(platform::loopMaxMs());
   json += ",\"resetReason\":\"" + String(platform::resetReason()) + "\"";
   json += ",\"relayCount\":" + String((int)cfg::kRelayCount);
   json += ",\"wifi\":{\"connected\":" + boolText(network::connected());
@@ -248,7 +251,7 @@ void handleWifiStatus() {
 }
 
 void handleWifiScanStart() {
-  if (!network::startScan()) return sendText(409, "busy");
+  if (!network::startScan()) return sendText(409, "scan could not start (busy or radio unavailable), try again");
   sendText(200, "ok");
 }
 
@@ -278,6 +281,11 @@ void handleWifiConnect() {
   if (!util::validSsid(ssid)) return sendText(400, "ssid must be 1-32 bytes of valid UTF-8 without control characters");
   if (!util::validWifiPassword(password)) {
     return sendText(400, "password must be empty (open network) or 8-63 bytes without control characters");
+  }
+  ota::State updateState = ota::status().state;
+  if (updateState == ota::State::Downloading || updateState == ota::State::Verifying ||
+      updateState == ota::State::Rebooting) {
+    return sendText(409, "a firmware update is in progress");
   }
   if (!network::requestConnect(ssid, password)) return sendText(409, "busy");
   sendText(200, "ok");

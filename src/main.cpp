@@ -38,13 +38,14 @@ void setup() {
   network::setOnConnected(scheduler::startNtp);
   network::begin();
   api::begin();
-  ota::setPump(pump);
   network::setPump(pump);
   platform::beginWatchdog();
 }
 
 void loop() {
+  unsigned long start = millis();
   pump();
   network::loop();
   ota::loop();
+  platform::noteLoopDuration(millis() - start);
 }

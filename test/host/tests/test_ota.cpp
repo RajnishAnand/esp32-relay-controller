@@ -4,14 +4,12 @@
 
 #include "../../../src/network.h"
 #include "../../../src/ota.h"
-#include "testlib.h"
+#include "api_helpers.h"
 
 const char* g_test_pubkey = "";
 static std::string pubKey;
 static std::string wrongKey;
 static std::string manifest, sig, firmware;
-
-static void tick() { delay(10); }
 
 static void prepare(bool connect = true) {
   pubKey = slurp(g_fixtureDir + "/pub.pem");
@@ -29,12 +27,11 @@ static void prepare(bool connect = true) {
     network::begin();
   }
   ota::begin();
-  ota::setPump(tick);
 }
 
 static void check() {
   CHECK(ota::requestCheck());
-  ota::loop();
+  runTasks();
 }
 
 static bool contains(const String& text, const char* part) { return text.s.find(part) != std::string::npos; }
@@ -123,6 +120,7 @@ TEST(ota_background_check_waits_then_runs) {
   CHECK(ota::status().state == ota::State::Idle);
   delay(cfg::kOtaFirstCheckDelayMs + 1);
   ota::loop();
+  runTasks();
   CHECK(ota::status().state == ota::State::Available);
 }
 
@@ -131,6 +129,7 @@ TEST(ota_background_check_failure_is_silent) {
   g_files.erase("manifest.txt");
   delay(cfg::kOtaFirstCheckDelayMs + 1);
   ota::loop();
+  runTasks();
   CHECK(ota::status().state == ota::State::Idle);
   CHECK(ota::status().message.length() == 0);
 }
@@ -146,7 +145,7 @@ TEST(ota_install_flashes_verified_image_and_arms_trial) {
   prepare();
   check();
   CHECK(ota::requestApply());
-  ota::loop();
+  runTasks();
   CHECK(ota::status().state == ota::State::Rebooting);
   CHECK(g_updateEnded && !g_updateAborted);
   CHECK(g_updateWritten == firmware);
@@ -159,7 +158,7 @@ TEST(ota_install_discards_a_corrupted_image) {
   check();
   g_files["firmware.bin"][g_files["firmware.bin"].size() / 2] ^= 0x55;
   CHECK(ota::requestApply());
-  ota::loop();
+  runTasks();
   CHECK(ota::status().state == ota::State::Error);
   CHECK(contains(ota::status().message, "hash"));
   CHECK(g_updateAborted && !g_updateEnded);
@@ -172,7 +171,7 @@ TEST(ota_install_refuses_a_size_that_differs_from_the_manifest) {
   check();
   g_files["firmware.bin"] += "extra";
   CHECK(ota::requestApply());
-  ota::loop();
+  runTasks();
   CHECK(ota::status().state == ota::State::Error);
   CHECK(!g_updateEnded);
 }
@@ -183,7 +182,7 @@ TEST(ota_install_waits_for_previous_update_to_confirm) {
   ota::begin();
   check();
   CHECK(ota::requestApply());
-  ota::loop();
+  runTasks();
   CHECK(ota::status().state == ota::State::Error);
   CHECK(contains(ota::status().message, "previous update"));
 }
@@ -219,4 +218,84 @@ TEST(ota_new_image_confirms_itself_after_staying_up) {
   ota::loop();
   CHECK(g_nvs["ota_pend"] == "0" && g_nvs["ota_boots"] == "0");
   CHECK(!ota::status().pendingConfirm);
+}
+
+TEST(ota_task_start_failure_is_reported_and_recoverable) {
+  prepare();
+  g_taskStartFails = true;
+  CHECK(ota::requestCheck());
+  CHECK(ota::status().state == ota::State::Error);
+  CHECK(contains(ota::status().message, "update task"));
+  g_taskStartFails = false;
+  check();
+  CHECK(ota::status().state == ota::State::Available);
+}
+
+TEST(ota_check_failure_names_the_http_status_and_free_memory) {
+  prepare();
+  g_files.erase("manifest.txt");
+  check();
+  CHECK(ota::status().state == ota::State::Error);
+  CHECK(contains(ota::status().message, "HTTP 404"));
+  CHECK(contains(ota::status().message, "largest free block 60000 bytes"));
+}
+
+TEST(ota_check_failure_names_connection_errors) {
+  prepare();
+  g_httpForceError = -1;
+  check();
+  CHECK(contains(ota::status().message, "connection refused"));
+  g_httpForceError = -11;
+  check();
+  CHECK(contains(ota::status().message, "read Timeout"));
+}
+
+TEST(ota_check_accepts_responses_without_a_content_length) {
+  prepare();
+  g_chunked = true;
+  check();
+  CHECK(ota::status().state == ota::State::Available);
+  CHECK(ota::status().latest == "1.0.1");
+}
+
+TEST(ota_apply_is_refused_while_a_check_is_running) {
+  prepare();
+  check();
+  CHECK(ota::status().state == ota::State::Available);
+  CHECK(ota::requestCheck());
+  CHECK(!ota::requestApply());
+  runTasks();
+  CHECK(ota::requestApply());
+}
+
+TEST(ota_install_failure_names_the_http_status) {
+  prepare();
+  check();
+  g_files.erase("firmware.bin");
+  CHECK(ota::requestApply());
+  runTasks();
+  CHECK(ota::status().state == ota::State::Error);
+  CHECK(contains(ota::status().message, "HTTP 404"));
+  CHECK(!g_updateEnded);
+}
+
+TEST(ota_install_progress_reaches_one_hundred_before_reboot) {
+  prepare();
+  check();
+  CHECK(ota::requestApply());
+  CHECK(ota::status().progress == 0);
+  runTasks();
+  CHECK(ota::status().progress == 100);
+}
+
+TEST(ota_a_wifi_change_is_refused_during_a_download) {
+  prepare();
+  g_nvs["api_token"] = kToken;
+  relays::begin();
+  scheduler::begin();
+  api::begin();
+  check();
+  CHECK(ota::requestApply());
+  CHECK(call(HTTP_POST, "/api/wifi/connect", args("ssid", "Other")).code == 409);
+  runTasks();
 }

@@ -167,3 +167,55 @@ TEST(wifi_switch_keeps_serving_requests_through_the_pump) {
   network::loop();
   CHECK(served > 0);
 }
+
+TEST(network_turns_wifi_modem_sleep_off) {
+  boot();
+  CHECK(!g_wifiSleep);
+}
+
+TEST(network_scan_uses_a_short_dwell_per_channel) {
+  boot();
+  CHECK(call(HTTP_POST, "/api/wifi/scan").code == 200);
+  CHECK(g_lastScanDwell == cfg::kScanDwellMs);
+}
+
+TEST(network_scan_stops_connection_attempts_and_pauses_retries_while_it_runs) {
+  g_wifiNetworks["elsewhere"] = "x-password-1";
+  g_nvs["wifi_ssid"] = "home";
+  g_nvs["wifi_pass"] = "home-pass-1";
+  boot();
+  CHECK(!network::connected());
+  int disconnectsBefore = g_wifiDisconnects;
+  CHECK(call(HTTP_POST, "/api/wifi/scan").code == 200);
+  CHECK(g_wifiDisconnects > disconnectsBefore);
+  CHECK(!g_autoReconnect);
+
+  int beginsBefore = g_beginCalls;
+  delay(cfg::kWifiRetryIntervalMs + 1);
+  network::loop();
+  CHECK(g_beginCalls == beginsBefore);
+
+  g_scanState = 0;
+  network::loop();
+  CHECK(g_autoReconnect);
+  CHECK(g_beginCalls == beginsBefore + 1);
+}
+
+TEST(network_scan_does_not_disturb_an_established_connection) {
+  bootOnHome();
+  int disconnectsBefore = g_wifiDisconnects;
+  CHECK(call(HTTP_POST, "/api/wifi/scan").code == 200);
+  CHECK(g_wifiDisconnects == disconnectsBefore);
+  CHECK(network::connected());
+}
+
+TEST(network_scan_reports_when_the_radio_refuses) {
+  boot();
+  g_scanStartFails = true;
+  HttpResponse r = call(HTTP_POST, "/api/wifi/scan");
+  CHECK(r.code == 409);
+  CHECK(has(r.body, "scan could not start"));
+  CHECK(g_autoReconnect);
+  g_scanStartFails = false;
+  CHECK(call(HTTP_POST, "/api/wifi/scan").code == 200);
+}

@@ -42,8 +42,15 @@ int g_scanStarts = 0;
 int g_softApStarts = 0;
 int g_softApStops = 0;
 std::string g_lastBeginSsid;
+int g_beginCalls = 0;
+int g_wifiDisconnects = 0;
+bool g_wifiSleep = true;
+bool g_autoReconnect = true;
+bool g_scanStartFails = false;
+uint32_t g_lastScanDwell = 0;
 bool WiFiClass::mode(WiFiMode_t) { return true; }
 void WiFiClass::begin(const char* ssid, const char* pass) {
+  g_beginCalls++;
   g_lastBeginSsid = ssid;
   std::map<std::string, std::string>::iterator it = g_wifiNetworks.find(ssid);
   bool ok = g_wifiNetworks.empty() || (it != g_wifiNetworks.end() && it->second == pass);
@@ -54,6 +61,7 @@ bool WiFiClass::config(IPAddress ip, IPAddress, IPAddress, IPAddress, IPAddress)
   return true;
 }
 bool WiFiClass::disconnect(bool) {
+  g_wifiDisconnects++;
   g_wifiStatus = WL_DISCONNECTED;
   return true;
 }
@@ -71,7 +79,9 @@ bool WiFiClass::softAPdisconnect(bool) {
   g_softApStops++;
   return true;
 }
-int16_t WiFiClass::scanNetworks(bool async, bool, bool, uint32_t, uint8_t, const char*, const uint8_t*) {
+int16_t WiFiClass::scanNetworks(bool async, bool, bool, uint32_t dwell, uint8_t, const char*, const uint8_t*) {
+  g_lastScanDwell = dwell;
+  if (g_scanStartFails) return WIFI_SCAN_FAILED;
   g_scanStarts++;
   g_scanState = async ? WIFI_SCAN_RUNNING : (int)g_scanEntries.size();
   return (int16_t)g_scanState;
@@ -83,6 +93,11 @@ int WiFiClass::RSSI(uint8_t i) { return g_scanEntries[i].rssi; }
 wifi_auth_mode_t WiFiClass::encryptionType(uint8_t i) { return (wifi_auth_mode_t)g_scanEntries[i].enc; }
 int WiFiClass::channel(uint8_t i) { return g_scanEntries[i].channel; }
 void WiFiClass::persistent(bool) {}
+bool WiFiClass::setSleep(bool enabled) {
+  g_wifiSleep = enabled;
+  return true;
+}
+void WiFiClass::setAutoReconnect(bool enabled) { g_autoReconnect = enabled; }
 int WiFiClass::RSSI() { return -55; }
 void WiFiClientSecure::setInsecure() {}
 void WiFiClientSecure::setCACert(const char*) {}
@@ -112,6 +127,8 @@ size_t Preferences::putString(const char* k, String v) {
 bool Preferences::remove(const char* k) { return g_nvs.erase(k) > 0; }
 
 std::map<std::string, std::string> g_files;
+int g_httpForceError = 0;
+bool g_chunked = false;
 static std::string curData;
 static std::string curName;
 static size_t curPos = 0;
@@ -133,12 +150,20 @@ bool HTTPClient::begin(WiFiClient&, String url) {
 void HTTPClient::setFollowRedirects(followRedirects_t) {}
 void HTTPClient::setTimeout(uint16_t) {}
 int HTTPClient::GET() {
+  if (g_httpForceError) return g_httpForceError;
   if (!g_files.count(curName)) return 404;
   curData = g_files[curName];
   curPos = 0;
   return 200;
 }
-int HTTPClient::getSize() { return (int)curData.size(); }
+int HTTPClient::getSize() { return g_chunked ? -1 : (int)curData.size(); }
+String HTTPClient::getString() {
+  String r;
+  r.s = curData;
+  curPos = curData.size();
+  return r;
+}
+String HTTPClient::errorToString(int e) { return e == -1 ? "connection refused" : e == -11 ? "read Timeout" : "error"; }
 WiFiClient* HTTPClient::getStreamPtr() {
   static WiFiClient c;
   return &c;
@@ -214,7 +239,34 @@ HttpResponse WebServer::perform(HTTPMethod method, const std::string& uri) {
   return response;
 }
 
+bool g_taskStartFails = false;
+static void (*g_pendingFn)(void*) = nullptr;
+static void* g_pendingArg = nullptr;
+void runTasks() {
+  void (*fn)(void*) = g_pendingFn;
+  void* arg = g_pendingArg;
+  g_pendingFn = nullptr;
+  if (fn) fn(arg);
+}
+
 namespace platform {
+void Mutex::init() {}
+void Mutex::lock() {}
+void Mutex::unlock() {}
+bool startTask(const char*, void (*fn)(void*), void* arg, uint32_t) {
+  if (g_taskStartFails) return false;
+  g_pendingFn = fn;
+  g_pendingArg = arg;
+  return true;
+}
+void sleepMs(uint32_t ms) { g_millis += ms; }
+static unsigned long g_loopMax = 0;
+void noteLoopDuration(unsigned long ms) {
+  if (ms > g_loopMax) g_loopMax = ms;
+}
+unsigned long loopMaxMs() { return g_loopMax; }
+uint32_t minFreeHeap() { return 90000; }
+uint32_t maxAllocHeap() { return 60000; }
 void beginWatchdog() {}
 void feed() { g_feeds++; }
 void restart() { g_restarts++; }

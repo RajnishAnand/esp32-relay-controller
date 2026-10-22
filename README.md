@@ -131,8 +131,8 @@ mbedtls 2.28 and 3.x are both supported (`src/mbedtls_compat.h`). If the headers
 location, pass `MBEDTLS_CFLAGS="-I/path/include" MBEDTLS_LIBS="-L/path/lib -lmbedcrypto"` to `make`.
 
 ```bash
-make -C test/host        # 93 host tests + syntax check of every source file
-(cd test/dashboard && npm install && npm test)   # 18 dashboard tests in a simulated browser (needs Node)
+make -C test/host        # 106 host tests + syntax check of every source file
+(cd test/dashboard && npm install && npm test)   # 24 dashboard tests in a simulated browser (needs Node)
 pio run -e esp32dev      # development build (needs include/secrets.h)
 pio run -e release       # release build (no secrets)
 ```
@@ -150,10 +150,10 @@ builds both firmware environments.
 |---|---|
 | Firmware compiles and links (`pio run -e esp32dev`, Arduino-ESP32 2.0.14) | Verified. Flash 1,004,621 of 1,310,720 bytes (76.6%), RAM 14.8% |
 | Relay switching on the pin set above | Verified on hardware (original prototype) |
-| Host tests (logic, validation, roles, WiFi flow, OTA trust chain) | Automated, 93 passing |
-| Dashboard behaviour (roles, WiFi, guest, updates, escaping) | Automated in jsdom, 18 passing |
+| Host tests (logic, validation, roles, WiFi flow, OTA trust chain, task handling) | Automated, 106 passing |
+| Dashboard behaviour (roles, WiFi, guest, updates, escaping, timeouts) | Automated in jsdom, 24 passing |
 | WiFi static IP, AP fallback, reconnect, **WiFi scan and network switching** | Not yet verified on hardware |
-| Watchdog, ESP32 `HTTPClient`/`Update`/redirect behaviour, live GitHub OTA | Not yet verified on hardware |
+| Watchdog, ESP32 `HTTPClient`/`Update`/redirect behaviour, live GitHub OTA, the OTA background task | Not yet verified on hardware |
 | `release` environment build, CI workflow and `release.sh` | Not yet run |
 
 Update this table as you verify each area on a real device.

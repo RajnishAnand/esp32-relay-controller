@@ -16,7 +16,22 @@ All notable changes are documented here. The format follows
   `POST /api/wifi/connect`. A switch saves the new credentials only after it connects, and reverts to the
   previous network on failure. A device with no network can be provisioned through its access point.
 - Dashboard: role-aware layout, WiFi scan/connect, guest password controls, error messages from the device.
-- Dashboard tests that run the real page in jsdom (18 tests), and 29 more host tests (93 total).
+- Dashboard tests that run the real page in jsdom (24 tests), and 42 more host tests (106 total).
+
+### Fixed (responsiveness)
+- **Update checks and downloads no longer freeze the device.** They run on a background task; previously a check
+  blocked the main loop for many seconds (several TLS handshakes), so the dashboard timed out.
+- Update failures now say why: the HTTP status or connection error, plus the largest free memory block.
+  Responses without a `Content-Length` (chunked) are accepted for the manifest files.
+- **WiFi scanning:** it now cancels a pending connection attempt, pauses reconnect retries while it runs, and
+  reports (`409`) when the radio refuses to start it. It listens 150 ms per channel instead of 300 ms.
+- WiFi modem sleep is turned off to avoid latency spikes and missed connections.
+- Network changes are refused while a firmware download is running.
+- Dashboard: 12 s request timeouts with a clear message, one polling request at a time (no pile-up behind a busy
+  device), and a scan that retries through transient failures instead of giving up.
+
+### Added (diagnostics)
+- `GET /api/info` reports `minFreeHeap`, `maxAllocHeap` and `loopMaxMs`.
 
 ### Changed
 - `/api/info` and the `/api/update/*` endpoints are admin-only (they always needed the only credential that

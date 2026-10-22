@@ -44,6 +44,8 @@ constexpr size_t kNameMaxLen = 24;
 constexpr uint8_t kGuestMaxFailures = 8;
 constexpr unsigned long kGuestLockoutMs = 60000;
 constexpr size_t kScanMaxResults = 20;
+constexpr uint32_t kScanDwellMs = 150;
+constexpr uint32_t kOtaTaskStackBytes = 16384;
 constexpr uint32_t kWatchdogTimeoutS = 60;
 
 constexpr unsigned long kOtaAutoCheckIntervalMs = 6UL * 3600UL * 1000UL;

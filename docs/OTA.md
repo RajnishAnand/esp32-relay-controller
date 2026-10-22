@@ -89,15 +89,18 @@ It does **not** catch:
 ## What an update does to your loads
 
 The device reboots. GPIOs drop, relays release, then saved state is restored (1 s settle plus the stagger).
-Expect loads to be off for several seconds. Do not install while something sensitive is running. A background
-check can block the main loop for several seconds on a poor network; schedule minutes skipped that way are
-recovered.
+Expect loads to be off for several seconds. Do not install while something sensitive is running.
+
+Checks and downloads run on a background task, so the dashboard, relays and schedules keep working while they
+run. Changing the WiFi network is refused while a download is in progress.
 
 ## Troubleshooting
 
 | Symptom | Likely cause |
 |---|---|
-| "Could not download manifest" | No release yet, repo not public, wrong owner/repo, or no internet |
+| "Could not download the manifest (HTTP 404 ...)" | No release published yet, repo not public, or wrong owner/repo |
+| "...(connection refused ...)", "...(read Timeout ...)" | No internet, DNS or TLS trouble, or the device is short of memory. The message ends with the largest free memory block; a TLS connection needs tens of kilobytes in one piece, so a small number there points to memory |
+| "Could not start the update task (low memory?)" | Not enough free memory for the 16 KB task stack. Reboot and try again; check `maxAllocHeap` in `/api/info` |
 | "Manifest signature INVALID" | Public key in `ota_config.h` does not match the signing key, or assets were edited |
 | "Firmware does not fit in the update slot" | Binary larger than one app slot |
 | "Firmware size does not match the signed manifest" | Server sent no Content-Length, or the asset was replaced after signing |

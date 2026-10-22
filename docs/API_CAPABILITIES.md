@@ -124,13 +124,19 @@ of them back. `200 ok`. Errors: relay errors, `missing enabled`, `enabled must b
 
 ```json
 {
-  "firmware": "1.0.0", "uptimeSeconds": 4210, "freeHeap": 168000, "resetReason": "power_on", "relayCount": 4,
+  "firmware": "1.0.0", "uptimeSeconds": 4210, "freeHeap": 168000, "minFreeHeap": 121000, "maxAllocHeap": 110000,
+  "loopMaxMs": 380, "resetReason": "power_on", "relayCount": 4,
   "wifi": { "connected": true, "apActive": false, "ip": "192.168.1.250", "rssi": -58 },
   "time": { "synced": true, "local": "2026-01-05 14:03" }
 }
 ```
 
 `time.local` appears only when synced. Use `time.synced` to know whether schedules are live.
+
+Diagnostics: `minFreeHeap` is the lowest free memory seen since boot, `maxAllocHeap` is the largest single block
+that can be allocated now (TLS needs tens of kilobytes in one piece), and `loopMaxMs` is the longest the main loop
+has taken since boot. A large `loopMaxMs` means something blocked the device; see
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md#timeouts-and-slow-or-missing-responses).
 
 ## Guest access endpoints  (admin)
 
@@ -155,7 +161,7 @@ use these endpoints.
 ### `POST /api/wifi/scan` then `GET /api/wifi/scan`
 
 Scanning is asynchronous. `POST` starts a scan (`200 ok`; `409 busy` while a network change is in progress;
-starting again while one runs is harmless). `GET` returns:
+starting again while one runs is harmless; `409 scan could not start (busy or radio unavailable), try again` if the radio refuses). `GET` returns:
 
 ```json
 { "state": "done", "networks": [ { "ssid": "Home", "rssi": -48, "secure": true, "channel": 11 } ] }
@@ -182,7 +188,8 @@ never returned.
 
 Form fields `ssid` (required) and `password` (omit or leave empty for an open network). Returns `200 ok`
 immediately; the switch happens afterwards. Errors: `missing ssid`, `ssid must be 1-32 bytes ...`,
-`password must be empty (open network) or 8-63 bytes without control characters`, `409 busy`.
+`password must be empty (open network) or 8-63 bytes without control characters`, `409 busy`, and
+`409 a firmware update is in progress`.
 
 ```bash
 curl -s -H "X-API-Key: $ADMIN" -d "ssid=Home" -d "password=correct-horse" "$BASE/api/wifi/connect"

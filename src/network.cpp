@@ -18,6 +18,7 @@ unsigned long lastRetryMs = 0;
 void (*onConnected)() = nullptr;
 void (*pumpFn)() = nullptr;
 
+bool scanning = false;
 bool changePending = false;
 String pendingSsid;
 String pendingPassword;
@@ -102,6 +103,7 @@ void stopAccessPoint() {
 }
 
 void markConnected() {
+  WiFi.setSleep(false);
   stationUp = true;
   led::setConnected(true);
   LOGI("connected, ip %s", WiFi.localIP().toString().c_str());
@@ -151,6 +153,7 @@ void performChange() {
 void begin() {
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
   led::setConnected(false);
   if (!credentials::wifiConfigured()) {
     LOGW("no WiFi credentials provisioned");
@@ -172,6 +175,10 @@ void loop() {
   if (!credentials::wifiConfigured()) return;
 
   if (WiFi.status() == WL_CONNECTED) {
+    if (scanning && scanState() != ScanState::Running) {
+      scanning = false;
+      WiFi.setAutoReconnect(true);
+    }
     if (!stationUp) markConnected();
     return;
   }
@@ -182,7 +189,11 @@ void loop() {
     LOGW("WiFi lost");
   }
   startAccessPoint();
-  if (platform::elapsed(lastRetryMs, cfg::kWifiRetryIntervalMs)) {
+  if (scanning && scanState() != ScanState::Running) {
+    scanning = false;
+    WiFi.setAutoReconnect(true);
+  }
+  if (!scanning && platform::elapsed(lastRetryMs, cfg::kWifiRetryIntervalMs)) {
     lastRetryMs = millis();
     beginSaved();
   }
@@ -220,8 +231,16 @@ ChangeStatus changeStatus() {
 bool startScan() {
   if (changePending || changeState == ChangeState::Trying) return false;
   if (WiFi.scanComplete() == WIFI_SCAN_RUNNING) return true;
+  if (!stationUp) {
+    WiFi.setAutoReconnect(false);
+    WiFi.disconnect();
+  }
   WiFi.scanDelete();
-  WiFi.scanNetworks(true);
+  if (WiFi.scanNetworks(true, false, false, cfg::kScanDwellMs) == WIFI_SCAN_FAILED) {
+    WiFi.setAutoReconnect(true);
+    return false;
+  }
+  scanning = true;
   return true;
 }
 

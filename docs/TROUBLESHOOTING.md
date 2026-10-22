@@ -31,6 +31,35 @@ Start with the serial monitor (`pio device monitor`, 115200 baud). The firmware 
 | `404` on `/api/update/check` | It is POST-only |
 | Dashboard shows "disconnected" briefly | The device is busy (boot, WiFi connect, update check); it recovers by itself |
 
+## Timeouts and slow or missing responses
+
+First measure, then diagnose. From a computer on the same network:
+
+```bash
+curl -s -o /dev/null -w "%{time_total}s\n" -H "X-API-Key: $ADMIN" http://<device>/api/status
+curl -s -H "X-API-Key: $ADMIN" http://<device>/api/info
+```
+
+| In `/api/info` | Meaning |
+|---|---|
+| `loopMaxMs` in the thousands | Something blocked the main loop for that long. Anything above about 2000 is worth investigating; WiFi connecting at boot and network changes legitimately take longer |
+| `maxAllocHeap` below roughly 50000 | Not enough contiguous memory for a TLS connection; update checks will fail with a connection error. `minFreeHeap` shows the lowest total free memory since boot |
+| `resetReason` is `watchdog`, `panic` or `brownout` | The device is restarting. A brownout usually means a weak power supply when relays and WiFi draw current together |
+
+Causes, most to least likely:
+
+| Symptom | Likely cause |
+|---|---|
+| The dashboard stalls for a second or two while scanning | Scanning takes the radio off your channel briefly. The dashboard keeps retrying through it |
+| Requests time out with a weak or distant signal | `rssi` in `/api/info` is worse than about -80 dBm. Move the device or the router |
+| Occasional single slow responses | The server handles one connection at a time and a browser can hold a spare idle connection open for a few seconds. This is a limit of the Arduino `WebServer`; it recovers by itself |
+| Everything stops for tens of seconds after tapping "Check for updates" | Should no longer happen: checks run on a background task. If it still does, send `loopMaxMs` and the serial log |
+| Dashboard says "The device did not answer in time" | The device took longer than 12 s. Retry; if it repeats, check `loopMaxMs` and power |
+
+WiFi modem sleep is disabled to avoid latency spikes. These causes are hypotheses from how the hardware and
+library behave; none has been confirmed on a device yet, so please report `/api/info` and the serial log if
+problems persist.
+
 ## WiFi changes
 
 | Symptom | Likely cause |
@@ -39,6 +68,8 @@ Start with the serial monitor (`pio device monitor`, 115200 baud). The firmware 
 | "Could not connect to X; the previous network was restored" | Wrong password, weak signal, or the network blocks new devices. Nothing was saved |
 | "...the previous network is unavailable" | The old network is gone too. The device retries it every 15 s and runs the fallback access point meanwhile |
 | Scan returns nothing | The scan is asynchronous; poll `GET /api/wifi/scan` until `state` is `done`. Hidden networks and names that are not valid UTF-8 are not listed |
+| "scan could not start (busy or radio unavailable)" | The radio refused (for example it was connecting). Try again in a few seconds |
+| "a firmware update is in progress" when connecting | Wait for the update to finish; network changes are refused during a download |
 | Cannot sign in on the fallback access point | Join `Relay-XXXX` with the AP password from `secrets.h`, then use `http://192.168.4.1/` and the admin token |
 | Guest password forgotten | An admin sets a new one under Settings > Guest access, or via `POST /api/guest/password` |
 | Re-flashing undid my WiFi change | You edited `secrets.h` since the last flash, so it was re-applied. Revert the edit, or set the WiFi again |

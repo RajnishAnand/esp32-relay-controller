@@ -19,12 +19,12 @@
 namespace ota {
 namespace {
 
+platform::Mutex stateLock;
 State state = State::Idle;
 String latest;
 String message;
-uint8_t progress = 0;
-bool checkRequested = false;
-bool applyRequested = false;
+volatile uint8_t progress = 0;
+bool workerRunning = false;
 bool everChecked = false;
 unsigned long lastCheckMs = 0;
 unsigned long autoCheckAnchor = 0;
@@ -33,16 +33,26 @@ bool pendingConfirm = false;
 unsigned long bootMs = 0;
 size_t stagedSize = 0;
 uint8_t stagedSha[32];
-void (*pumpFn)() = nullptr;
+String fetchError;
+
+struct CheckOutcome {
+  bool ok;
+  String error;
+  State state;
+  String latest;
+  String message;
+  size_t stagedSize;
+  uint8_t sha[32];
+};
 
 bool configured() {
   return !util::isPlaceholder(OTA_GITHUB_OWNER) && !util::isPlaceholder(OTA_GITHUB_REPO) &&
          !util::isPlaceholder(OTA_PUBLIC_KEY_PEM);
 }
 
-void pump() {
-  platform::feed();
-  if (pumpFn) pumpFn();
+bool busyLocked() {
+  return state == State::Checking || state == State::Downloading || state == State::Verifying ||
+         state == State::Rebooting;
 }
 
 void configureTls(WiFiClientSecure& client) {
@@ -54,6 +64,8 @@ void configureTls(WiFiClientSecure& client) {
 }
 
 String baseUrl() { return String("https://github.com/") + OTA_GITHUB_OWNER + "/" + OTA_GITHUB_REPO + "/releases/"; }
+
+String memoryNote() { return String("; largest free block ") + String((unsigned long)platform::maxAllocHeap()) + " bytes"; }
 
 bool verifySignature(const uint8_t* data, size_t len, const uint8_t* sig, size_t sigLen) {
   mbedtls_pk_context pk;
@@ -76,15 +88,29 @@ int fetchSmall(const String& url, uint8_t* buf, size_t maxBytes) {
   HTTPClient http;
   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
   http.setTimeout(10000);
-  if (!http.begin(client, url)) return -1;
+  if (!http.begin(client, url)) {
+    fetchError = "could not start the request";
+    return -1;
+  }
   int code = http.GET();
   if (code != HTTP_CODE_OK) {
-    LOGW("OTA GET failed: HTTP %d", code);
+    fetchError = code > 0 ? String("HTTP ") + String(code) : HTTPClient::errorToString(code);
     http.end();
     return -1;
   }
   int len = http.getSize();
-  if (len <= 0 || (size_t)len > maxBytes) {
+  if (len < 0) {
+    String body = http.getString();
+    http.end();
+    if (body.length() == 0 || body.length() > maxBytes) {
+      fetchError = "unexpected response size";
+      return -1;
+    }
+    memcpy(buf, body.c_str(), body.length());
+    return (int)body.length();
+  }
+  if (len == 0 || (size_t)len > maxBytes) {
+    fetchError = "unexpected response size";
     http.end();
     return -1;
   }
@@ -102,24 +128,38 @@ int fetchSmall(const String& url, uint8_t* buf, size_t maxBytes) {
     } else if (!http.connected()) {
       break;
     } else {
-      delay(5);
+      platform::sleepMs(5);
     }
   }
   http.end();
-  return got == len ? got : -1;
+  if (got != len) {
+    fetchError = "timed out reading the response";
+    return -1;
+  }
+  return got;
 }
 
-const char* checkInner() {
+CheckOutcome failure(const String& text) {
+  CheckOutcome out;
+  out.ok = false;
+  out.error = text;
+  out.state = State::Error;
+  out.stagedSize = 0;
+  memset(out.sha, 0, sizeof(out.sha));
+  return out;
+}
+
+CheckOutcome performCheck() {
   String base = baseUrl() + "latest/download/";
   static uint8_t manifestBuf[cfg::kOtaMaxManifestBytes + 1];
   static uint8_t sigBuf[80];
 
   int manifestLen = fetchSmall(base + "manifest.txt", manifestBuf, cfg::kOtaMaxManifestBytes);
-  if (manifestLen < 0) return "Could not download manifest (no release yet, or network error)";
+  if (manifestLen < 0) return failure("Could not download the manifest (" + fetchError + ")" + memoryNote());
   int sigLen = fetchSmall(base + "manifest.sig", sigBuf, sizeof(sigBuf));
-  if (sigLen < 0) return "Could not download manifest signature";
+  if (sigLen < 0) return failure("Could not download the manifest signature (" + fetchError + ")" + memoryNote());
   if (!verifySignature(manifestBuf, (size_t)manifestLen, sigBuf, (size_t)sigLen))
-    return "Manifest signature INVALID - refusing update";
+    return failure("Manifest signature INVALID - refusing update");
 
   manifestBuf[manifestLen] = 0;
   String manifest((const char*)manifestBuf);
@@ -127,99 +167,105 @@ const char* checkInner() {
   long size = util::manifestValue(manifest, "size").toInt();
   uint8_t sha[32];
   int a, b, c;
-  if (!util::parseSemver(version, a, b, c)) return "Manifest has an invalid version";
-  if (size < 100000 || size > 4L * 1024 * 1024) return "Manifest has an invalid size";
+  if (!util::parseSemver(version, a, b, c)) return failure("Manifest has an invalid version");
+  if (size < 100000 || size > 4L * 1024 * 1024) return failure("Manifest has an invalid size");
   if (!util::hexToBytes(util::manifestValue(manifest, "sha256"), sha, sizeof(sha)))
-    return "Manifest has an invalid sha256";
+    return failure("Manifest has an invalid sha256");
 
-  latest = version;
-  message = "";
-  if (!util::isNewerVersion(version, FIRMWARE_VERSION)) {
-    state = State::UpToDate;
-    return nullptr;
-  }
+  CheckOutcome out = failure("");
+  out.ok = true;
+  out.latest = version;
+  out.state = State::UpToDate;
+  if (!util::isNewerVersion(version, FIRMWARE_VERSION)) return out;
   if (storage::prefs().getString("ota_bad", "") == version) {
-    state = State::UpToDate;
-    message = String("v") + version + " failed on this device and was rolled back; waiting for a newer release";
-    return nullptr;
+    out.message = String("v") + version + " failed on this device and was rolled back; waiting for a newer release";
+    return out;
   }
-  stagedSize = (size_t)size;
-  memcpy(stagedSha, sha, sizeof(sha));
-  state = State::Available;
-  return nullptr;
+  out.state = State::Available;
+  out.stagedSize = (size_t)size;
+  memcpy(out.sha, sha, sizeof(sha));
+  return out;
 }
 
-bool runCheck(bool userInitiated) {
-  if (!configured()) {
-    if (userInitiated) {
-      state = State::Error;
-      message = "Updates are not configured in the firmware";
-    }
-    return false;
+void checkWorker(void* arg) {
+  bool userInitiated = arg != nullptr;
+  State previousState;
+  String previousMessage;
+  {
+    platform::Guard guard(stateLock);
+    previousState = state;
+    previousMessage = message;
+    state = State::Checking;
   }
-  if (!network::connected()) {
-    if (userInitiated) {
-      state = State::Error;
-      message = "Not connected to WiFi";
-    }
-    return false;
-  }
-  State previousState = state;
-  String previousMessage = message;
-  state = State::Checking;
-  const char* error = checkInner();
-  if (error != nullptr) {
-    LOGW("OTA check failed: %s", error);
-    if (userInitiated) {
-      state = State::Error;
-      message = error;
+
+  CheckOutcome out;
+  if (!configured()) out = failure("Updates are not configured in the firmware");
+  else if (!network::connected()) out = failure("Not connected to WiFi");
+  else out = performCheck();
+
+  {
+    platform::Guard guard(stateLock);
+    if (!out.ok) {
+      LOGW("OTA check failed: %s", out.error.c_str());
+      if (userInitiated) {
+        state = State::Error;
+        message = out.error;
+      } else {
+        state = previousState;
+        message = previousMessage;
+      }
     } else {
-      state = previousState;
-      message = previousMessage;
+      latest = out.latest;
+      message = out.message;
+      state = out.state;
+      if (out.state == State::Available) {
+        stagedSize = out.stagedSize;
+        memcpy(stagedSha, out.sha, sizeof(stagedSha));
+      }
+      everChecked = true;
+      lastCheckMs = millis();
+      LOGI("OTA check: latest v%s, running v%s", out.latest.c_str(), FIRMWARE_VERSION);
     }
-    return false;
+    workerRunning = false;
   }
-  everChecked = true;
-  lastCheckMs = millis();
-  LOGI("OTA check: latest v%s, running v%s", latest.c_str(), FIRMWARE_VERSION);
-  return true;
 }
 
-void fail(const char* text) {
-  LOGW("OTA install failed: %s", text);
-  state = State::Error;
-  message = text;
+void setState(State next) {
+  platform::Guard guard(stateLock);
+  state = next;
 }
 
-void runInstall() {
-  if (stagedSize == 0 || latest.length() == 0) return fail("No update is staged");
-  if (pendingConfirm) return fail("The previous update has not confirmed yet - wait a minute and retry");
-  if (!network::connected()) return fail("Not connected to WiFi");
+String install(const String& version, size_t size, const uint8_t* expectedSha) {
+  if (size == 0 || version.length() == 0) return "No update is staged";
+  bool unconfirmed;
+  {
+    platform::Guard guard(stateLock);
+    unconfirmed = pendingConfirm;
+  }
+  if (unconfirmed) return "The previous update has not confirmed yet - wait a minute and retry";
+  if (!network::connected()) return "Not connected to WiFi";
 
-  state = State::Downloading;
-  progress = 0;
-  message = "";
-
-  String url = baseUrl() + "download/v" + latest + "/firmware.bin";
+  String url = baseUrl() + "download/v" + version + "/firmware.bin";
   WiFiClientSecure client;
   configureTls(client);
   HTTPClient http;
   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
   http.setTimeout(10000);
-  if (!http.begin(client, url)) return fail("Could not start the download");
+  if (!http.begin(client, url)) return "Could not start the download";
   int code = http.GET();
   if (code != HTTP_CODE_OK) {
     http.end();
-    return fail("Firmware download failed (HTTP error)");
+    return "Firmware download failed (" + (code > 0 ? String("HTTP ") + String(code) : HTTPClient::errorToString(code)) +
+           ")" + memoryNote();
   }
   int len = http.getSize();
-  if (len <= 0 || (size_t)len != stagedSize) {
+  if (len <= 0 || (size_t)len != size) {
     http.end();
-    return fail("Firmware size does not match the signed manifest");
+    return "Firmware size does not match the signed manifest";
   }
-  if (!Update.begin(stagedSize)) {
+  if (!Update.begin(size)) {
     http.end();
-    return fail("Firmware does not fit in the update slot");
+    return "Firmware does not fit in the update slot";
   }
 
   mbedtls_sha256_context sha;
@@ -230,15 +276,15 @@ void runInstall() {
   WiFiClient* stream = http.getStreamPtr();
   size_t written = 0;
   unsigned long lastData = millis();
-  const char* error = nullptr;
+  String error;
 
-  while (written < stagedSize) {
-    pump();
+  while (written < size) {
+    platform::feed();
     int avail = stream->available();
     if (avail > 0) {
       size_t want = (size_t)avail;
       if (want > sizeof(buf)) want = sizeof(buf);
-      if (want > stagedSize - written) want = stagedSize - written;
+      if (want > size - written) want = size - written;
       size_t n = stream->readBytes(buf, want);
       if (n == 0) {
         error = "Download read error";
@@ -251,7 +297,8 @@ void runInstall() {
       }
       written += n;
       lastData = millis();
-      progress = (uint8_t)((written * 100UL) / stagedSize);
+      progress = (uint8_t)((written * 100UL) / size);
+      platform::sleepMs(1);
     } else {
       if (!http.connected()) {
         error = "Connection closed before the download finished";
@@ -261,7 +308,7 @@ void runInstall() {
         error = "Download stalled";
         break;
       }
-      delay(2);
+      platform::sleepMs(2);
     }
   }
   http.end();
@@ -270,15 +317,15 @@ void runInstall() {
   mbedcompat::sha256Finish(&sha, digest);
   mbedtls_sha256_free(&sha);
 
-  if (error != nullptr) {
+  if (error.length() > 0) {
     Update.abort();
-    return fail(error);
+    return error;
   }
 
-  state = State::Verifying;
-  if (memcmp(digest, stagedSha, sizeof(digest)) != 0) {
+  setState(State::Verifying);
+  if (memcmp(digest, expectedSha, sizeof(digest)) != 0) {
     Update.abort();
-    return fail("Firmware hash does not match the signed manifest - discarded");
+    return "Firmware hash does not match the signed manifest - discarded";
   }
 
   Preferences& prefs = storage::prefs();
@@ -286,14 +333,34 @@ void runInstall() {
   prefs.putUChar("ota_boots", 0);
   if (!Update.end()) {
     prefs.putBool("ota_pend", false);
-    return fail("Finalizing the update failed");
+    return "Finalizing the update failed";
   }
 
-  state = State::Rebooting;
+  setState(State::Rebooting);
   LOGI("OTA image verified and activated, rebooting");
-  unsigned long start = millis();
-  while (millis() - start < 1500) pump();
+  platform::sleepMs(1500);
   platform::restart();
+  return "";
+}
+
+void installWorker(void*) {
+  size_t size;
+  uint8_t sha[32];
+  String version;
+  {
+    platform::Guard guard(stateLock);
+    size = stagedSize;
+    memcpy(sha, stagedSha, sizeof(sha));
+    version = latest;
+  }
+  String error = install(version, size, sha);
+  platform::Guard guard(stateLock);
+  if (error.length() > 0) {
+    LOGW("OTA install failed: %s", error.c_str());
+    state = State::Error;
+    message = error;
+  }
+  workerRunning = false;
 }
 
 const char* stateName(State s) {
@@ -317,14 +384,17 @@ const char* stateName(State s) {
   }
 }
 
-bool isBusy() {
-  return state == State::Checking || state == State::Downloading || state == State::Verifying ||
-         state == State::Rebooting;
+void abandon(const char* text) {
+  platform::Guard guard(stateLock);
+  workerRunning = false;
+  state = State::Error;
+  message = text;
 }
 
 }  // namespace
 
 void begin() {
+  stateLock.init();
   bootMs = millis();
   autoCheckAnchor = bootMs;
   Preferences& prefs = storage::prefs();
@@ -349,53 +419,68 @@ void begin() {
   LOGE("rollback target unavailable, staying on this firmware");
 }
 
-void setPump(void (*pump)()) { pumpFn = pump; }
-
 void loop() {
-  if (pendingConfirm && platform::elapsed(bootMs, cfg::kOtaConfirmAfterMs)) {
+  bool confirmNow = false;
+  {
+    platform::Guard guard(stateLock);
+    if (pendingConfirm && platform::elapsed(bootMs, cfg::kOtaConfirmAfterMs)) {
+      pendingConfirm = false;
+      confirmNow = true;
+    }
+  }
+  if (confirmNow) {
     Preferences& prefs = storage::prefs();
     prefs.putBool("ota_pend", false);
     prefs.putUChar("ota_boots", 0);
-    pendingConfirm = false;
     LOGI("OTA new firmware confirmed");
   }
 
-  if (applyRequested) {
-    applyRequested = false;
-    runInstall();
-    return;
-  }
-  if (checkRequested) {
-    checkRequested = false;
-    runCheck(true);
-    return;
-  }
-
   unsigned long wait = firstAutoCheckDone ? cfg::kOtaAutoCheckIntervalMs : cfg::kOtaFirstCheckDelayMs;
-  if (network::connected() && configured() && !pendingConfirm && platform::elapsed(autoCheckAnchor, wait)) {
-    autoCheckAnchor = millis();
-    firstAutoCheckDone = true;
-    runCheck(false);
+  if (!platform::elapsed(autoCheckAnchor, wait) || !network::connected() || !configured()) return;
+  {
+    platform::Guard guard(stateLock);
+    if (workerRunning || pendingConfirm || busyLocked()) return;
+    workerRunning = true;
+  }
+  autoCheckAnchor = millis();
+  firstAutoCheckDone = true;
+  if (!platform::startTask("ota-check", checkWorker, nullptr, cfg::kOtaTaskStackBytes)) {
+    platform::Guard guard(stateLock);
+    workerRunning = false;
   }
 }
 
 bool requestCheck() {
-  if (isBusy()) return false;
-  checkRequested = true;
-  state = State::Checking;
+  {
+    platform::Guard guard(stateLock);
+    if (workerRunning || busyLocked()) return false;
+    workerRunning = true;
+    state = State::Checking;
+    message = "";
+  }
+  if (!platform::startTask("ota-check", checkWorker, (void*)1, cfg::kOtaTaskStackBytes)) {
+    abandon("Could not start the update task (low memory?)");
+  }
   return true;
 }
 
 bool requestApply() {
-  if (state != State::Available) return false;
-  applyRequested = true;
-  state = State::Downloading;
-  progress = 0;
-  message = "";
+  {
+    platform::Guard guard(stateLock);
+    if (workerRunning || state != State::Available) return false;
+    workerRunning = true;
+    state = State::Downloading;
+    progress = 0;
+    message = "";
+  }
+  if (!platform::startTask("ota-install", installWorker, nullptr, cfg::kOtaTaskStackBytes)) {
+    abandon("Could not start the update task (low memory?)");
+  }
   return true;
 }
 
 Status status() {
+  platform::Guard guard(stateLock);
   Status s;
   s.state = state;
   s.stateName = stateName(state);
